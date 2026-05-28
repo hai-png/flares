@@ -113,7 +113,7 @@ done
 echo ""
 echo "[3/8] Installing core Python dependencies..."
 
-$PYTHON_CMD -m pip install --upgrade pip setuptools wheel
+$PYTHON_CMD -m pip install --upgrade pip "setuptools<82" wheel
 
 # Install core deps without strict version pins.
 # These are shared across multiple pipeline components.
@@ -159,7 +159,7 @@ $PYTHON_CMD -m pip install -e . --no-deps --quiet 2>/dev/null || \
 
 # Install RF-DETR's actual runtime dependencies (without strict pins)
 $PYTHON_CMD -m pip install --quiet \
-    transformers \
+    "transformers>=5.1.0,<6.0.0" \
     diffusers \
     accelerate \
     timm \
@@ -407,10 +407,19 @@ $PYTHON_CMD -m pip install -e . --no-deps --quiet 2>/dev/null || \
 $PYTHON_CMD -m pip install --quiet "pydantic>=2.0" 2>/dev/null || \
     echo "  ⚠ pydantic upgrade failed"
 
+# Ensure transformers >= 5.1.0 for rfdetr (BackboneConfigMixin is v5+ only)
+CURRENT_TRANSFORMERS=$($PYTHON_CMD -c "import transformers; print(transformers.__version__)" 2>/dev/null || echo "0.0.0")
+echo "  Current transformers: $CURRENT_TRANSFORMERS"
+$PYTHON_CMD -m pip install --quiet "transformers>=5.1.0,<6.0.0" 2>/dev/null || \
+    echo "  ⚠ transformers upgrade failed"
+NEW_TRANSFORMERS=$($PYTHON_CMD -c "import transformers; print(transformers.__version__)" 2>/dev/null || echo "unknown")
+echo "  Upgraded transformers: $NEW_TRANSFORMERS"
+
 if $PYTHON_CMD -c "import rfdetr" 2>/dev/null; then
     echo "  ✓ RF-DETR installed successfully"
 else
-    echo "  ⚠ RF-DETR import still failing"
+    echo "  ⚠ RF-DETR import still failing — check transformers version"
+    $PYTHON_CMD -c "import transformers; print(f'  transformers version: {transformers.__version__}')" 2>/dev/null
 fi
 
 # ─── Download Model Weights ────────────────────────────────────
@@ -493,6 +502,8 @@ try:
     print('  ✓ RF-DETR')
 except Exception as e:
     print(f'  ✗ RF-DETR: {e}')
+    import transformers
+    print(f'    (transformers version: {transformers.__version__}, need >=5.1.0 for BackboneConfigMixin)')
 
 try:
     from hy3dshape.pipelines import Hunyuan3DDiTFlowMatchingPipeline

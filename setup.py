@@ -29,7 +29,7 @@ setup(
     extras_require={
         "full": [
             "rfdetr",
-            "transformers>=4.46",
+            "transformers>=5.1.0,<6.0.0",
             "diffusers>=0.30",
             "accelerate>=1.1",
             "rembg>=2.0",
