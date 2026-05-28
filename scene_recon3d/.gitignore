@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+venv/
+.env/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Model weights and caches
+ckpt/
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+.cache/
+hy3dgen/
+
+# Output
+output/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Repos (cloned separately)
+repos/
+
+# Large files
+*.glb
+*.obj
+*.ply
+*.stl
+*.npy
