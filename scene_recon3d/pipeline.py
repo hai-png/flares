@@ -1,0 +1,486 @@
+"""Main Pipeline Orchestrator: 3D Scene Reconstruction.
+
+This module ties together all the pipeline stages:
+  1. RF-DETR    → 2D object detection + instance segmentation
+  2. WildDet3D  → 3D bounding box estimation from 2D boxes
+  3. Hunyuan3D  → Per-object 3D mesh generation
+  4. Alignment  → Scale and pose alignment using 3D bounding boxes
+  5. MARCO      → Semantic correspondence for pose refinement
+
+The pipeline processes a single RGB image (with optional camera intrinsics)
+and produces a complete 3D scene reconstruction with textured meshes
+placed in a unified 3D coordinate space.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import time
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Tuple
+
+import numpy as np
+import trimesh
+from omegaconf import OmegaConf
+
+from .modules.rfdetr_detector import RFDETRDetector
+from .modules.wilddet3d_estimator import WildDet3DEstimator
+from .modules.hunyuan3d_generator import Hunyuan3DGenerator
+from .modules.marco_refiner import MARCORefiner
+from .utils.data_types import DetectedObject, ObjectReconstructionResult, SceneReconstructionResult
+from .utils.geometry import align_mesh_to_bbox, crop_image_with_mask
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class PipelineStats:
+    """Timing and statistics for each pipeline stage."""
+    total_time: float = 0.0
+    stage_times: Dict[str, float] = field(default_factory=dict)
+    num_objects_detected: int = 0
+    num_objects_3d: int = 0
+    num_objects_meshed: int = 0
+    num_objects_refined: int = 0
+
+
+class SceneReconstructionPipeline:
+    """Complete 3D scene reconstruction pipeline.
+
+    Combines RF-DETR, WildDet3D, Hunyuan3D-2.1+FlashVDM, and MARCO
+    to reconstruct a complete 3D scene from a single RGB image.
+
+    Pipeline flow:
+        ┌─────────────┐     ┌─────────────┐
+        │   Input      │────▶│   RF-DETR   │
+        │   Image      │     │ (2D boxes + │
+        │              │     │   masks)    │
+        └─────────────┘     └──────┬──────┘
+                                    │
+                          ┌─────────▼──────────┐
+                          │    WildDet3D        │
+                          │  (3D bounding boxes │
+                          │   in camera space)  │
+                          └─────────┬──────────┘
+                                    │
+                    ┌───────────────┼───────────────┐
+                    │               │               │
+              ┌─────▼─────┐  ┌─────▼─────┐  ┌─────▼─────┐
+              │ Hunyuan3D  │  │ Hunyuan3D  │  │ Hunyuan3D  │
+              │ (mesh for  │  │ (mesh for  │  │ (mesh for  │
+              │  obj 1)    │  │  obj 2)    │  │  obj N)    │
+              └─────┬─────┘  └─────┬─────┘  └─────┬─────┘
+                    │               │               │
+                    └───────┬───────┘───────────────┘
+                            │
+                  ┌─────────▼──────────┐
+                  │  Scale + Pose      │
+                  │  Alignment         │
+                  │  (using 3D bboxes) │
+                  └─────────┬──────────┘
+                            │
+                  ┌─────────▼──────────┐
+                  │     MARCO          │
+                  │  (pose refinement  │
+                  │   via semantic     │
+                  │   correspondence)  │
+                  └─────────┬──────────┘
+                            │
+                  ┌─────────▼──────────┐
+                  │  Final 3D Scene    │
+                  │  Reconstruction    │
+                  └────────────────────┘
+
+    Example:
+        >>> pipeline = SceneReconstructionPipeline.from_config("configs/pipeline_config.yaml")
+        >>> result = pipeline.reconstruct("scene_image.jpg")
+        >>> result.export_scene("output/scene.glb")
+    """
+
+    def __init__(
+        self,
+        # RF-DETR params
+        rfdetr_variant: str = "seg_medium",
+        rfdetr_confidence: float = 0.5,
+        # WildDet3D params
+        wilddet3d_checkpoint: str = "ckpt/wilddet3d_alldata_all_prompt_v1.0.pt",
+        wilddet3d_score_threshold: float = 0.3,
+        wilddet3d_use_predicted_intrinsics: bool = True,
+        # Hunyuan3D params
+        hunyuan3d_model_path: str = "tencent/Hunyuan3D-2.1",
+        hunyuan3d_subfolder: str = "hunyuan3d-dit-v2-1",
+        hunyuan3d_enable_flashvdm: bool = True,
+        hunyuan3d_num_steps: int = 50,
+        hunyuan3d_guidance_scale: float = 5.0,
+        hunyuan3d_octree_resolution: int = 384,
+        hunyuan3d_generate_texture: bool = True,
+        # MARCO params
+        marco_use_torch_hub: bool = True,
+        marco_inference_res: int = 840,
+        marco_num_keypoints: int = 20,
+        marco_refinement_iterations: int = 3,
+        # General params
+        device: str = "cuda",
+        output_dir: str = "output/scene",
+        save_intermediate: bool = True,
+        render_resolution: int = 512,
+        min_object_area: int = 100,
+    ):
+        """Initialize the pipeline with all module configurations.
+
+        Args:
+            rfdetr_variant: RF-DETR model variant (seg_* for masks)
+            rfdetr_confidence: Detection confidence threshold
+            wilddet3d_checkpoint: Path to WildDet3D checkpoint
+            wilddet3d_score_threshold: 3D detection score threshold
+            wilddet3d_use_predicted_intrinsics: Predict intrinsics for in-the-wild images
+            hunyuan3d_model_path: Hunyuan3D model path (HF or local)
+            hunyuan3d_subfolder: DiT model subfolder
+            hunyuan3d_enable_flashvdm: Enable FlashVDM acceleration
+            hunyuan3d_num_steps: Denoising steps
+            hunyuan3d_guidance_scale: CFG guidance scale
+            hunyuan3d_octree_resolution: Mesh resolution
+            hunyuan3d_generate_texture: Generate PBR textures
+            marco_use_torch_hub: Auto-download MARCO via torch.hub
+            marco_inference_res: MARCO inference resolution
+            marco_num_keypoints: Keypoints per object for refinement
+            marco_refinement_iterations: Number of refinement iterations
+            device: Compute device
+            output_dir: Directory for output files
+            save_intermediate: Save intermediate results
+            render_resolution: Resolution for mesh rendering
+            min_object_area: Minimum mask area to process an object
+        """
+        self.device = device
+        self.output_dir = output_dir
+        self.save_intermediate = save_intermediate
+        self.render_resolution = render_resolution
+        self.min_object_area = min_object_area
+
+        # Initialize all modules (lazy loading - models loaded on first use)
+        self.detector = RFDETRDetector(
+            variant=rfdetr_variant,
+            confidence_threshold=rfdetr_confidence,
+            device=device,
+        )
+
+        self.estimator_3d = WildDet3DEstimator(
+            checkpoint=wilddet3d_checkpoint,
+            score_threshold=wilddet3d_score_threshold,
+            use_predicted_intrinsics=wilddet3d_use_predicted_intrinsics,
+            device=device,
+        )
+
+        self.generator = Hunyuan3DGenerator(
+            model_path=hunyuan3d_model_path,
+            subfolder=hunyuan3d_subfolder,
+            enable_flashvdm=hunyuan3d_enable_flashvdm,
+            num_inference_steps=hunyuan3d_num_steps,
+            guidance_scale=hunyuan3d_guidance_scale,
+            octree_resolution=hunyuan3d_octree_resolution,
+            generate_texture=hunyuan3d_generate_texture,
+            device=device,
+        )
+
+        self.refiner = MARCORefiner(
+            use_torch_hub=marco_use_torch_hub,
+            inference_res=marco_inference_res,
+            num_keypoints_per_object=marco_num_keypoints,
+            refinement_iterations=marco_refinement_iterations,
+            device=device,
+        )
+
+        self._stats = PipelineStats()
+
+    @classmethod
+    def from_config(cls, config_path: str) -> "SceneReconstructionPipeline":
+        """Create a pipeline from a YAML configuration file.
+
+        Args:
+            config_path: Path to the YAML config file
+
+        Returns:
+            Configured SceneReconstructionPipeline instance
+        """
+        cfg = OmegaConf.load(config_path)
+
+        rfdetr = cfg.get("rfdetr", {})
+        wilddet3d = cfg.get("wilddet3d", {})
+        hunyuan3d = cfg.get("hunyuan3d", {})
+        marco = cfg.get("marco", {})
+        pipeline = cfg.get("pipeline", {})
+
+        return cls(
+            # RF-DETR
+            rfdetr_variant=rfdetr.get("model_variant", "seg_medium"),
+            rfdetr_confidence=rfdetr.get("confidence_threshold", 0.5),
+            # WildDet3D
+            wilddet3d_checkpoint=wilddet3d.get(
+                "checkpoint", "ckpt/wilddet3d_alldata_all_prompt_v1.0.pt"
+            ),
+            wilddet3d_score_threshold=wilddet3d.get("score_threshold", 0.3),
+            wilddet3d_use_predicted_intrinsics=wilddet3d.get(
+                "use_predicted_intrinsics", True
+            ),
+            # Hunyuan3D
+            hunyuan3d_model_path=hunyuan3d.get("model_path", "tencent/Hunyuan3D-2.1"),
+            hunyuan3d_subfolder=hunyuan3d.get("subfolder", "hunyuan3d-dit-v2-1"),
+            hunyuan3d_enable_flashvdm=hunyuan3d.get("enable_flashvdm", True),
+            hunyuan3d_num_steps=hunyuan3d.get("num_inference_steps", 50),
+            hunyuan3d_guidance_scale=hunyuan3d.get("guidance_scale", 5.0),
+            hunyuan3d_octree_resolution=hunyuan3d.get("octree_resolution", 384),
+            hunyuan3d_generate_texture=hunyuan3d.get("generate_texture", True),
+            # MARCO
+            marco_use_torch_hub=marco.get("use_torch_hub", True),
+            marco_inference_res=marco.get("inference_res", 840),
+            marco_num_keypoints=marco.get("num_keypoints_per_object", 20),
+            marco_refinement_iterations=marco.get("refinement_iterations", 3),
+            # Pipeline
+            device=pipeline.get("device", "cuda"),
+            output_dir=pipeline.get("output_dir", "output/scene"),
+            save_intermediate=pipeline.get("save_intermediate", True),
+            render_resolution=pipeline.get("render_resolution", 512),
+            min_object_area=pipeline.get("min_object_area", 100),
+        )
+
+    def load_all_models(self):
+        """Pre-load all models before running the pipeline.
+
+        This is optional but recommended to avoid lazy loading during
+        the first pipeline run, which can cause delays.
+        """
+        logger.info("Pre-loading all pipeline models...")
+
+        logger.info("[1/4] Loading RF-DETR...")
+        self.detector.load_model()
+
+        logger.info("[2/4] Loading WildDet3D...")
+        self.estimator_3d.load_model()
+
+        logger.info("[3/4] Loading Hunyuan3D-2.1 + FlashVDM...")
+        self.generator.load_model()
+
+        logger.info("[4/4] Loading MARCO...")
+        self.refiner.load_model()
+
+        logger.info("All models loaded successfully!")
+
+    def reconstruct(
+        self,
+        image: np.ndarray | str,
+        intrinsics: Optional[np.ndarray] = None,
+        class_names: Optional[List[str]] = None,
+        output_dir: Optional[str] = None,
+    ) -> SceneReconstructionResult:
+        """Run the full 3D scene reconstruction pipeline.
+
+        Args:
+            image: Input image as numpy array (H,W,3) or file path string
+            intrinsics: Optional (3,3) camera intrinsic matrix
+            class_names: Optional list of class names for 3D prompting
+            output_dir: Override output directory
+
+        Returns:
+            SceneReconstructionResult with all reconstructed objects
+        """
+        start_time = time.time()
+        output_dir = output_dir or self.output_dir
+        os.makedirs(output_dir, exist_ok=True)
+
+        # Load image if path provided
+        if isinstance(image, str):
+            from PIL import Image as PILImage
+            image = np.array(PILImage.open(image).convert("RGB"))
+
+        h, w = image.shape[:2]
+        logger.info(f"Starting 3D scene reconstruction on {w}×{h} image")
+
+        # ═══════════════════════════════════════════════════════════
+        # Stage 1: RF-DETR — 2D Object Detection + Instance Segmentation
+        # ═══════════════════════════════════════════════════════════
+        t0 = time.time()
+        logger.info("=" * 60)
+        logger.info("Stage 1: RF-DETR — 2D Detection + Segmentation")
+        logger.info("=" * 60)
+
+        objects = self.detector.detect(
+            image,
+            min_area=self.min_object_area,
+        )
+        self._stats.stage_times["1_rfdetr"] = time.time() - t0
+        self._stats.num_objects_detected = len(objects)
+
+        if not objects:
+            logger.warning("No objects detected! Returning empty result.")
+            return SceneReconstructionResult(image_shape=(h, w))
+
+        # Save detection visualization
+        if self.save_intermediate:
+            vis = self.detector.visualize(image, objects)
+            import cv2
+            cv2.imwrite(os.path.join(output_dir, "1_detections.png"), cv2.cvtColor(vis, cv2.COLOR_RGB2BGR))
+
+        # ═══════════════════════════════════════════════════════════
+        # Stage 2: WildDet3D — 3D Bounding Box Estimation
+        # ═══════════════════════════════════════════════════════════
+        t0 = time.time()
+        logger.info("=" * 60)
+        logger.info("Stage 2: WildDet3D — 3D Bounding Box Estimation")
+        logger.info("=" * 60)
+
+        objects = self.estimator_3d.estimate_3d(
+            image, objects, intrinsics=intrinsics, class_names=class_names
+        )
+        camera_intrinsics = self.estimator_3d.get_intrinsics()
+        self._stats.stage_times["2_wilddet3d"] = time.time() - t0
+        self._stats.num_objects_3d = sum(1 for o in objects if o.bbox_3d is not None)
+
+        # ═══════════════════════════════════════════════════════════
+        # Stage 3: Hunyuan3D — Per-Object 3D Mesh Generation
+        # ═══════════════════════════════════════════════════════════
+        t0 = time.time()
+        logger.info("=" * 60)
+        logger.info("Stage 3: Hunyuan3D-2.1 + FlashVDM — 3D Mesh Generation")
+        logger.info("=" * 60)
+
+        mesh_dir = os.path.join(output_dir, "meshes")
+        objects = self.generator.generate_meshes_for_objects(
+            image, objects, output_dir=mesh_dir
+        )
+        self._stats.stage_times["3_hunyuan3d"] = time.time() - t0
+        self._stats.num_objects_meshed = sum(1 for o in objects if o.mesh is not None)
+
+        # ═══════════════════════════════════════════════════════════
+        # Stage 4: Scale & Pose Alignment using 3D Bounding Boxes
+        # ═══════════════════════════════════════════════════════════
+        t0 = time.time()
+        logger.info("=" * 60)
+        logger.info("Stage 4: Scale + Pose Alignment (3D Bounding Boxes)")
+        logger.info("=" * 60)
+
+        for obj in objects:
+            if obj.mesh is None or obj.bbox_3d is None:
+                logger.warning(
+                    f"Object {obj.object_id}: skipping alignment "
+                    f"(mesh={'✓' if obj.mesh else '✗'}, 3D bbox={'✓' if obj.bbox_3d else '✗'})"
+                )
+                continue
+
+            aligned_mesh, scale_factor, rotation, translation = align_mesh_to_bbox(
+                mesh=obj.mesh,
+                bbox_center=obj.bbox_3d_center,
+                bbox_dims=obj.bbox_3d_dims,
+                bbox_quat=obj.bbox_3d_quat,
+            )
+
+            obj.aligned_mesh = aligned_mesh
+            obj.scale_factor = scale_factor
+            obj.initial_rotation = rotation
+            obj.initial_translation = translation
+
+            logger.info(
+                f"Object {obj.object_id} ({obj.class_name}): "
+                f"scale={scale_factor:.4f}, "
+                f"center={obj.bbox_3d_center}, "
+                f"dims={obj.bbox_3d_dims}"
+            )
+
+        self._stats.stage_times["4_alignment"] = time.time() - t0
+
+        # Save aligned meshes
+        if self.save_intermediate:
+            aligned_dir = os.path.join(output_dir, "aligned")
+            os.makedirs(aligned_dir, exist_ok=True)
+            for obj in objects:
+                if obj.aligned_mesh is not None:
+                    path = os.path.join(aligned_dir, f"{obj.class_name}_{obj.object_id}.glb")
+                    obj.aligned_mesh.export(path)
+
+        # ═══════════════════════════════════════════════════════════
+        # Stage 5: MARCO — Pose Refinement via Semantic Correspondence
+        # ═══════════════════════════════════════════════════════════
+        t0 = time.time()
+        logger.info("=" * 60)
+        logger.info("Stage 5: MARCO — Pose Refinement")
+        logger.info("=" * 60)
+
+        if camera_intrinsics is not None:
+            objects = self.refiner.refine_poses(
+                objects, camera_intrinsics, render_resolution=self.render_resolution
+            )
+        else:
+            logger.warning(
+                "No camera intrinsics available; skipping MARCO refinement"
+            )
+
+        self._stats.stage_times["5_marco"] = time.time() - t0
+        self._stats.num_objects_refined = sum(
+            1 for o in objects if o.refined_rotation is not None
+        )
+
+        # ═══════════════════════════════════════════════════════════
+        # Build Final Result
+        # ═══════════════════════════════════════════════════════════
+        result_objects = []
+        for obj in objects:
+            if obj.aligned_mesh is None:
+                continue
+
+            # Use the final mesh (refined if available, else aligned)
+            final_mesh = obj.aligned_mesh
+
+            # Build the final transform
+            if obj.refined_rotation is not None:
+                R = obj.refined_rotation
+                t = obj.refined_translation
+            else:
+                R = obj.initial_rotation
+                t = obj.initial_translation
+
+            T = np.eye(4)
+            T[:3, :3] = R
+            T[:3, 3] = t
+
+            result_obj = ObjectReconstructionResult(
+                object_id=obj.object_id,
+                class_name=obj.class_name,
+                mesh=final_mesh,
+                transform=T,
+                bbox_3d=obj.bbox_3d if obj.bbox_3d is not None else np.zeros(10),
+                confidence=obj.confidence,
+            )
+            result_objects.append(result_obj)
+
+        result = SceneReconstructionResult(
+            objects=result_objects,
+            camera_intrinsics=camera_intrinsics,
+            image_shape=(h, w),
+        )
+
+        # Export final scene
+        scene_path = os.path.join(output_dir, "scene.glb")
+        result.export_scene(scene_path)
+        logger.info(f"Final scene exported to {scene_path}")
+
+        self._stats.total_time = time.time() - start_time
+        self._log_stats()
+
+        return result
+
+    def _log_stats(self):
+        """Log pipeline execution statistics."""
+        logger.info("=" * 60)
+        logger.info("Pipeline Statistics")
+        logger.info("=" * 60)
+        logger.info(f"Total time: {self._stats.total_time:.2f}s")
+        for stage, t in self._stats.stage_times.items():
+            logger.info(f"  {stage}: {t:.2f}s")
+        logger.info(f"Objects detected: {self._stats.num_objects_detected}")
+        logger.info(f"Objects with 3D bbox: {self._stats.num_objects_3d}")
+        logger.info(f"Objects with mesh: {self._stats.num_objects_meshed}")
+        logger.info(f"Objects refined: {self._stats.num_objects_refined}")
+
+    def get_stats(self) -> PipelineStats:
+        """Get the execution statistics from the last pipeline run."""
+        return self._stats
