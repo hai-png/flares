@@ -49,11 +49,11 @@ class WildDet3DEstimator:
 
         Args:
             checkpoint: Path to the WildDet3D checkpoint file
-            score_threshold: Combined 2D×3D score threshold
+            score_threshold: Combined 2D*3D score threshold
             score_3d_threshold: Standalone 3D confidence threshold
             use_predicted_intrinsics: Use predicted camera intrinsics for
                                       in-the-wild images without known K
-            canonical_rotation: Normalize dimensions W≤L, yaw∈[0,π)
+            canonical_rotation: Normalize dimensions W<=L, yaw in [0,pi)
             device: Device to run on
         """
         self.checkpoint = checkpoint
@@ -72,28 +72,43 @@ class WildDet3DEstimator:
         that auto-adds third_party submodules to sys.path on import.
         We also add third_party dirs manually as a fallback.
         """
-        repo_path = os.path.join(
-            os.path.dirname(__file__), "..", "..", "repos", "WildDet3D"
-        )
-        repo_path = os.path.abspath(repo_path)
+        # Determine repos directory from multiple possible locations
+        this_dir = os.path.dirname(os.path.abspath(__file__))
+        package_dir = os.path.dirname(this_dir)
+        project_dir = os.path.dirname(package_dir)
 
         # Support FLARES_REPO_DIR env var for custom locations
         env_repo = os.environ.get("FLARES_REPO_DIR", "")
-        search_paths = [repo_path]
+        search_bases = [project_dir]
         if env_repo:
-            search_paths.insert(0, os.path.join(env_repo, "WildDet3D"))
+            search_bases.insert(0, env_repo)
 
-        for candidate in search_paths:
+        for base in search_bases:
+            candidate = os.path.join(base, "repos", "WildDet3D")
             if os.path.isdir(os.path.join(candidate, "wilddet3d")):
                 if candidate not in sys.path:
                     sys.path.insert(0, candidate)
                     logger.info(f"Added to sys.path: {candidate}")
 
                 # Also add third_party dirs for submodule imports
-                # (wilddet3d/__init__.py does this too, but pre-add
-                # in case __init__.py import fails partially)
                 for submodule in ["sam3", "lingbot_depth", "moge"]:
                     sub_path = os.path.join(candidate, "third_party", submodule)
+                    if os.path.isdir(sub_path) and sub_path not in sys.path:
+                        sys.path.insert(0, sub_path)
+                        logger.info(f"Added to sys.path: {sub_path}")
+
+                return True
+
+        # Try from current working directory
+        for candidate in ["repos/WildDet3D", "WildDet3D"]:
+            if os.path.isdir(os.path.join(candidate, "wilddet3d")):
+                abs_candidate = os.path.abspath(candidate)
+                if abs_candidate not in sys.path:
+                    sys.path.insert(0, abs_candidate)
+                    logger.info(f"Added to sys.path: {abs_candidate}")
+
+                for submodule in ["sam3", "lingbot_depth", "moge"]:
+                    sub_path = os.path.join(abs_candidate, "third_party", submodule)
                     if os.path.isdir(sub_path) and sub_path not in sys.path:
                         sys.path.insert(0, sub_path)
                         logger.info(f"Added to sys.path: {sub_path}")
@@ -141,6 +156,7 @@ class WildDet3DEstimator:
                 "  git clone --recurse-submodules https://github.com/allenai/WildDet3D.git repos/WildDet3D\n"
                 "The pipeline auto-adds repos/WildDet3D to sys.path.\n"
                 "Also install dependencies: pip install vis4d einops timm transformers\n"
+                f"Current sys.path entries with 'wilddet': {[p for p in sys.path if 'wilddet' in p.lower()]}\n"
                 f"Original error: {e}"
             )
 
@@ -217,10 +233,12 @@ class WildDet3DEstimator:
                         use_predicted_intrinsics=self.use_predicted_intrinsics,
                     )
 
-                    if self.use_predicted_intrinsics:
-                        boxes, boxes3d, scores, scores_2d, scores_3d, class_ids, depth_maps = results[:7]
-                    else:
-                        boxes, boxes3d, scores, scores_2d, scores_3d, class_ids, depth_maps = results[:7]
+                    # Unpack results - different versions may return different numbers of outputs
+                    boxes = results[0]
+                    boxes3d = results[1]
+                    scores = results[2]
+                    scores_2d = results[3]
+                    scores_3d = results[4] if len(results) > 4 else None
 
                     # Extract 3D box for this object
                     if len(boxes3d) > 0 and len(boxes3d[0]) > 0:
@@ -230,7 +248,7 @@ class WildDet3DEstimator:
                         obj.bbox_3d_dims = bbox_3d[3:6]     # w, l, h
                         obj.bbox_3d_quat = bbox_3d[6:10]    # qw, qx, qy, qz
 
-                        if len(scores_3d) > 0 and len(scores_3d[0]) > 0:
+                        if scores_3d is not None and len(scores_3d) > 0 and len(scores_3d[0]) > 0:
                             obj.score_3d = float(scores_3d[0][0].cpu())
 
                         logger.info(

@@ -23,17 +23,73 @@ def setup_logging(level: str = "INFO"):
     )
 
 
+def check_environment():
+    """Check that all required dependencies are available."""
+    import torch
+    logger = logging.getLogger(__name__)
+
+    logger.info(f"PyTorch: {torch.__version__}")
+    logger.info(f"CUDA available: {torch.cuda.is_available()}")
+    if torch.cuda.is_available():
+        logger.info(f"CUDA device: {torch.cuda.get_device_name(0)}")
+
+    import numpy as np
+    logger.info(f"NumPy: {np.__version__}")
+
+    # Check each pipeline component
+    checks = {}
+
+    try:
+        import rfdetr
+        checks["RF-DETR"] = True
+    except ImportError as e:
+        checks["RF-DETR"] = False
+        logger.warning(f"RF-DETR not available: {e}")
+
+    try:
+        # Ensure paths are set up
+        from scene_recon3d.utils.setup_paths import setup_repo_paths
+        setup_repo_paths()
+        from hy3dshape.pipelines import Hunyuan3DDiTFlowMatchingPipeline
+        checks["Hunyuan3D-Shape"] = True
+    except ImportError as e:
+        checks["Hunyuan3D-Shape"] = False
+        logger.warning(f"Hunyuan3D-Shape not available: {e}")
+
+    try:
+        from textureGenPipeline import Hunyuan3DPaintPipeline
+        checks["Hunyuan3D-Paint"] = True
+    except ImportError:
+        checks["Hunyuan3D-Paint"] = False
+        logger.info("Hunyuan3D-Paint not available (optional, texture generation will be skipped)")
+
+    try:
+        from wilddet3d import build_model
+        checks["WildDet3D"] = True
+    except ImportError as e:
+        checks["WildDet3D"] = False
+        logger.warning(f"WildDet3D not available: {e}")
+
+    # Print summary
+    logger.info("Component availability:")
+    for name, available in checks.items():
+        status = "OK" if available else "MISSING"
+        logger.info(f"  {name}: {status}")
+
+    return checks
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="3D Scene Reconstruction Pipeline",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Pipeline Stages:
-  1. RF-DETR     — 2D object detection + instance segmentation
-  2. WildDet3D   — 3D bounding box estimation from 2D boxes
-  3. Hunyuan3D   — Per-object 3D mesh generation
-  4. Alignment   — Scale and pose alignment using 3D bounding boxes
-  5. MARCO       — Pose refinement via semantic correspondence
+  1. RF-DETR     -- 2D object detection + instance segmentation
+  2. WildDet3D   -- 3D bounding box estimation from 2D boxes
+  3. Hunyuan3D   -- Per-object 3D mesh generation
+  4. Alignment   -- Scale and pose alignment using 3D bounding boxes
+  5. MARCO       -- Pose refinement via semantic correspondence
 
 Examples:
   # Basic usage with auto-downloaded models
@@ -44,12 +100,15 @@ Examples:
 
   # Quick test with smaller models
   python run_pipeline.py --image scene.jpg --rfdetr-variant seg_nano --no-flashvdm --steps 5
+
+  # Check environment only
+  python run_pipeline.py --check-env
         """,
     )
 
     # Required arguments
     parser.add_argument(
-        "--image", type=str, required=True,
+        "--image", type=str, default=None,
         help="Path to the input scene image"
     )
 
@@ -80,6 +139,7 @@ Examples:
     parser.add_argument("--no-texture", action="store_true", help="Skip texture generation")
     parser.add_argument("--refinement-iters", type=int, default=None, help="MARCO refinement iterations")
     parser.add_argument("--preload", action="store_true", help="Pre-load all models before running")
+    parser.add_argument("--check-env", action="store_true", help="Check environment and exit")
 
     # Logging
     parser.add_argument(
@@ -92,7 +152,31 @@ Examples:
     setup_logging(args.log_level)
     logger = logging.getLogger(__name__)
 
-    # ─── Build Pipeline ───────────────────────────────────────
+    # Check environment
+    checks = check_environment()
+
+    if args.check_env:
+        print("\nEnvironment check complete. Exiting.")
+        return
+
+    # Require --image unless --check-env
+    if args.image is None:
+        parser.error("--image is required (use --check-env to verify environment only)")
+
+    # Verify critical components
+    missing = [name for name, ok in checks.items() if not ok and name in ["RF-DETR", "Hunyuan3D-Shape", "WildDet3D"]]
+    if missing:
+        logger.error(
+            f"Critical components missing: {missing}. "
+            "Please run setup.sh first or install missing dependencies."
+        )
+        logger.error(
+            "Tip: Set FLARES_REPO_DIR if repos are in a non-default location. "
+            "E.g.: export FLARES_REPO_DIR=/content/flares/repos"
+        )
+        sys.exit(1)
+
+    # --- Build Pipeline ---
     from scene_recon3d.pipeline import SceneReconstructionPipeline
 
     if args.config:
@@ -124,7 +208,7 @@ Examples:
     if args.preload:
         pipeline.load_all_models()
 
-    # ─── Load Inputs ──────────────────────────────────────────
+    # --- Load Inputs ---
     from PIL import Image
 
     logger.info(f"Loading image: {args.image}")
@@ -135,7 +219,7 @@ Examples:
         logger.info(f"Loading intrinsics: {args.intrinsics}")
         intrinsics = np.load(args.intrinsics)
 
-    # ─── Run Pipeline ─────────────────────────────────────────
+    # --- Run Pipeline ---
     logger.info("Starting 3D scene reconstruction pipeline...")
     result = pipeline.reconstruct(
         image=image,
@@ -143,7 +227,7 @@ Examples:
         output_dir=args.output,
     )
 
-    # ─── Report Results ───────────────────────────────────────
+    # --- Report Results ---
     stats = pipeline.get_stats()
     logger.info("=" * 60)
     logger.info("Reconstruction Complete!")

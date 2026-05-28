@@ -82,11 +82,30 @@ class MARCORefiner:
         a local checkpoint file.
         """
         # Add MARCO repo to path if needed
-        repo_path = os.path.join(
-            os.path.dirname(__file__), "..", "..", "repos", "MARCO"
-        )
-        if os.path.exists(repo_path) and repo_path not in sys.path:
-            sys.path.insert(0, repo_path)
+        this_dir = os.path.dirname(os.path.abspath(__file__))
+        package_dir = os.path.dirname(this_dir)
+        project_dir = os.path.dirname(package_dir)
+
+        # Support FLARES_REPO_DIR env var
+        env_repo = os.environ.get("FLARES_REPO_DIR", "")
+        search_bases = [project_dir]
+        if env_repo:
+            search_bases.insert(0, env_repo)
+
+        for base in search_bases:
+            repo_path = os.path.join(base, "repos", "MARCO")
+            if os.path.exists(repo_path) and repo_path not in sys.path:
+                sys.path.insert(0, repo_path)
+                logger.info(f"Added to sys.path: {repo_path}")
+                break
+
+        # Also try from cwd
+        for candidate in ["repos/MARCO", "MARCO"]:
+            abs_candidate = os.path.abspath(candidate)
+            if os.path.exists(abs_candidate) and abs_candidate not in sys.path:
+                sys.path.insert(0, abs_candidate)
+                logger.info(f"Added to sys.path: {abs_candidate}")
+                break
 
         logger.info("Loading MARCO model...")
 
@@ -118,11 +137,17 @@ class MARCORefiner:
             self.model = self.model.to(self.device).eval()
             logger.info("MARCO model loaded from local checkpoint")
 
-        except ImportError:
+        except ImportError as e:
             raise ImportError(
                 "MARCO is not installed. Please install it:\n"
                 "  cd repos/MARCO && pip install -r requirements.txt\n"
-                "  Or use use_torch_hub=True to auto-download"
+                "  Or use use_torch_hub=True to auto-download\n"
+                f"Original error: {e}"
+            )
+        except FileNotFoundError:
+            raise FileNotFoundError(
+                f"MARCO checkpoint not found at {self.checkpoint}. "
+                "Use use_torch_hub=True to auto-download, or provide the checkpoint path."
             )
 
     def find_correspondences(
@@ -178,8 +203,6 @@ class MARCORefiner:
 
             # We need to convert from MARCO's resized+padded space back to
             # original target image space.
-            # MARCO's preprocess_data pads images to square with the longest side
-            # at inference_res. We need to reverse this transform.
             tgt_h, tgt_w = target_image.shape[:2]
             scale = self.inference_res / max(tgt_h, tgt_w)
             pad_w = self.inference_res - int(tgt_w * scale)
@@ -279,14 +302,11 @@ class MARCORefiner:
             )
 
             # Scale source keypoints to render resolution
-            if obj.crop_image is not None:
-                h_ratio = render_resolution / obj.crop_image.shape[0]
-                w_ratio = render_resolution / obj.crop_image.shape[1]
-                src_kps_scaled = src_keypoints.copy()
-                src_kps_scaled[:, 0] *= w_ratio
-                src_kps_scaled[:, 1] *= h_ratio
-            else:
-                src_kps_scaled = src_keypoints
+            h_ratio = render_resolution / obj.crop_image.shape[0]
+            w_ratio = render_resolution / obj.crop_image.shape[1]
+            src_kps_scaled = src_keypoints.copy()
+            src_kps_scaled[:, 0] *= w_ratio
+            src_kps_scaled[:, 1] *= h_ratio
 
             # 3. Find correspondences using MARCO
             try:
@@ -319,16 +339,11 @@ class MARCORefiner:
             obj.correspondence_points_tgt = tgt_kps_valid
 
             # 4. Get 3D points on the mesh for these keypoints
-            # Map source keypoints back to mesh surface
             src_kps_original = src_kps_valid.copy()
-            if obj.crop_image is not None:
-                src_kps_original[:, 0] /= w_ratio
-                src_kps_original[:, 1] /= h_ratio
+            src_kps_original[:, 0] /= w_ratio
+            src_kps_original[:, 1] /= h_ratio
 
             try:
-                # Get 3D points on the canonical mesh
-                # We use the crop bbox to establish a mapping from
-                # crop image coords to mesh coords
                 points_3d = get_mesh_3d_points_for_2d_keypoints(
                     obj.mesh,
                     src_kps_original,

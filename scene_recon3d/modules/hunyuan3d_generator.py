@@ -4,8 +4,8 @@ This module wraps Hunyuan3D-2.1 with FlashVDM acceleration to generate
 high-fidelity textured 3D meshes from masked object images.
 
 Hunyuan3D-2.1 is a two-stage pipeline:
-  Stage 1: Shape Generation (3.3B DiT + VAE) → untextured mesh
-  Stage 2: Texture Generation (2B Paint pipeline) → PBR-textured mesh
+  Stage 1: Shape Generation (3.3B DiT + VAE) -> untextured mesh
+  Stage 2: Texture Generation (2B Paint pipeline) -> PBR-textured mesh
 
 FlashVDM accelerates Stage 1 by:
   - Using sparse top-K cross-attention in the VAE decoder
@@ -111,29 +111,57 @@ class Hunyuan3DGenerator:
         - ./hy3dpaint must be on sys.path for `from textureGenPipeline import ...`
         The hy3dshape dir contains a nested package: hy3dshape/hy3dshape/
         """
-        repo_path = os.path.join(
-            os.path.dirname(__file__), "..", "..", "repos", "Hunyuan3D-2.1"
-        )
-        repo_path = os.path.abspath(repo_path)
+        # Determine repos directory from multiple possible locations
+        this_dir = os.path.dirname(os.path.abspath(__file__))
+        package_dir = os.path.dirname(this_dir)      # scene_recon3d/
+        project_dir = os.path.dirname(package_dir)    # flares/
 
-        # Check common locations: ./repos/Hunyuan3D-2.1 and ./repos/Hunyuan3D-2.1
-        # Also support FLARES_REPO_DIR env var for custom locations
+        # Support FLARES_REPO_DIR env var for custom locations
         env_repo = os.environ.get("FLARES_REPO_DIR", "")
-        search_paths = [repo_path]
+        search_bases = [project_dir]
         if env_repo:
-            search_paths.insert(0, os.path.join(env_repo, "Hunyuan3D-2.1"))
+            search_bases.insert(0, env_repo)
 
-        for candidate in search_paths:
+        for base in search_bases:
+            candidate = os.path.join(base, "repos", "Hunyuan3D-2.1")
             hy3dshape_dir = os.path.join(candidate, "hy3dshape")
             hy3dpaint_dir = os.path.join(candidate, "hy3dpaint")
+
+            # Check for nested package structure: hy3dshape/hy3dshape/
             if os.path.isdir(os.path.join(hy3dshape_dir, "hy3dshape")):
-                # Found the nested package structure: hy3dshape/hy3dshape/
                 if hy3dshape_dir not in sys.path:
                     sys.path.insert(0, hy3dshape_dir)
                     logger.info(f"Added to sys.path: {hy3dshape_dir}")
                 if hy3dpaint_dir not in sys.path:
                     sys.path.insert(0, hy3dpaint_dir)
                     logger.info(f"Added to sys.path: {hy3dpaint_dir}")
+                return True
+
+            # Also check if the repo itself is the base (e.g. running inside the repo)
+            if os.path.isdir(os.path.join(base, "hy3dshape", "hy3dshape")):
+                hy3dshape_inner = os.path.join(base, "hy3dshape")
+                hy3dpaint_inner = os.path.join(base, "hy3dpaint")
+                if hy3dshape_inner not in sys.path:
+                    sys.path.insert(0, hy3dshape_inner)
+                    logger.info(f"Added to sys.path: {hy3dshape_inner}")
+                if hy3dpaint_inner not in sys.path:
+                    sys.path.insert(0, hy3dpaint_inner)
+                    logger.info(f"Added to sys.path: {hy3dpaint_inner}")
+                return True
+
+        # Try to find it in the current working directory structure
+        for candidate_dir in ["repos/Hunyuan3D-2.1", "Hunyuan3D-2.1"]:
+            hy3dshape_dir = os.path.join(candidate_dir, "hy3dshape")
+            hy3dpaint_dir = os.path.join(candidate_dir, "hy3dpaint")
+            if os.path.isdir(os.path.join(hy3dshape_dir, "hy3dshape")):
+                abs_hy3dshape = os.path.abspath(hy3dshape_dir)
+                abs_hy3dpaint = os.path.abspath(hy3dpaint_dir)
+                if abs_hy3dshape not in sys.path:
+                    sys.path.insert(0, abs_hy3dshape)
+                    logger.info(f"Added to sys.path: {abs_hy3dshape}")
+                if abs_hy3dpaint not in sys.path:
+                    sys.path.insert(0, abs_hy3dpaint)
+                    logger.info(f"Added to sys.path: {abs_hy3dpaint}")
                 return True
 
         return False
@@ -172,6 +200,7 @@ class Hunyuan3DGenerator:
                 "Make sure the repos are cloned:\n"
                 "  git clone https://github.com/Tencent-Hunyuan/Hunyuan3D-2.1.git repos/Hunyuan3D-2.1\n"
                 "The pipeline auto-adds repos/Hunyuan3D-2.1/hy3dshape and hy3dpaint to sys.path.\n"
+                f"Current sys.path entries with 'hy3d': {[p for p in sys.path if 'hy3d' in p.lower()]}\n"
                 f"Original error: {e}"
             )
 
@@ -184,13 +213,19 @@ class Hunyuan3DGenerator:
         # Enable FlashVDM
         if self.enable_flashvdm:
             logger.info("Enabling FlashVDM acceleration...")
-            self.shape_pipeline.enable_flashvdm(
-                enabled=True,
-                adaptive_kv_selection=self.flashvdm_adaptive_kv,
-                topk_mode=self.flashvdm_topk_mode,
-                mc_algo=self.mc_algo,
-                replace_vae=True,
-            )
+            try:
+                self.shape_pipeline.enable_flashvdm(
+                    enabled=True,
+                    adaptive_kv_selection=self.flashvdm_adaptive_kv,
+                    topk_mode=self.flashvdm_topk_mode,
+                    mc_algo=self.mc_algo,
+                    replace_vae=True,
+                )
+            except Exception as e:
+                logger.warning(
+                    f"FlashVDM enable failed: {e}. Continuing without FlashVDM."
+                )
+                self.enable_flashvdm = False
 
         # Load texture pipeline (optional)
         if self.generate_texture:
@@ -199,26 +234,43 @@ class Hunyuan3DGenerator:
                 from textureGenPipeline import Hunyuan3DPaintPipeline, Hunyuan3DPaintConfig
 
                 # Find config and checkpoint paths
-                repo_base = os.path.join(
-                    os.path.dirname(__file__), "..", "..", "repos", "Hunyuan3D-2.1"
-                )
+                # Search for the repo base directory
+                repo_base = None
+                for p in sys.path:
+                    if "hy3dpaint" in p and os.path.isdir(p):
+                        parent = os.path.dirname(p)
+                        if os.path.isdir(os.path.join(parent, "hy3dshape")):
+                            repo_base = parent
+                            break
+
+                if repo_base is None:
+                    # Fallback: use relative path
+                    repo_base = os.path.join(
+                        os.path.dirname(__file__), "..", "..", "repos", "Hunyuan3D-2.1"
+                    )
+                    repo_base = os.path.abspath(repo_base)
+
                 realesrgan_path = self.realesrgan_ckpt
                 if not os.path.isabs(realesrgan_path):
-                    realesrgan_path = os.path.join(repo_base, realesrgan_path)
+                    realesrgan_path = os.path.join(repo_base, realesrgan_ckpt)
 
                 paint_cfg_path = os.path.join(repo_base, "hy3dpaint", "cfgs", "hunyuan-paint-pbr.yaml")
                 custom_pipeline_path = os.path.join(repo_base, "hy3dpaint", "hunyuanpaintpbr")
 
-                conf = Hunyuan3DPaintConfig(
-                    max_num_view=self.texture_max_num_view,
-                    resolution=self.texture_resolution,
-                )
-                conf.realesrgan_ckpt_path = realesrgan_path
-                conf.multiview_cfg_path = paint_cfg_path
-                conf.custom_pipeline = custom_pipeline_path
+                if not os.path.exists(paint_cfg_path):
+                    logger.warning(f"Paint config not found at {paint_cfg_path}, skipping texture pipeline")
+                    self.paint_pipeline = None
+                else:
+                    conf = Hunyuan3DPaintConfig(
+                        max_num_view=self.texture_max_num_view,
+                        resolution=self.texture_resolution,
+                    )
+                    conf.realesrgan_ckpt_path = realesrgan_path
+                    conf.multiview_cfg_path = paint_cfg_path
+                    conf.custom_pipeline = custom_pipeline_path
 
-                self.paint_pipeline = Hunyuan3DPaintPipeline(conf)
-                logger.info("Texture pipeline loaded successfully")
+                    self.paint_pipeline = Hunyuan3DPaintPipeline(conf)
+                    logger.info("Texture pipeline loaded successfully")
 
             except Exception as e:
                 logger.warning(
@@ -367,8 +419,8 @@ class Hunyuan3DGenerator:
             except Exception as e:
                 logger.warning(f"Texture generation failed: {e}. Using untextured mesh.")
 
-        # Save if path provided
-        if output_path and not (self.paint_pipeline is not None):
+        # Save if path provided (and texture pipeline didn't already save)
+        if output_path and self.paint_pipeline is None:
             mesh.export(output_path)
 
         n_verts = len(mesh.vertices)

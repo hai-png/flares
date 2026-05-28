@@ -88,10 +88,17 @@ class RFDETRDetector:
         Downloads pretrained COCO weights automatically on first use.
         Weights are cached at ~/.roboflow/models/.
         """
-        from rfdetr import (
-            RFDETRSegNano, RFDETRSegSmall, RFDETRSegMedium,
-            RFDETRSegLarge, RFDETRSegXLarge, RFDETRSeg2XLarge,
-        )
+        try:
+            from rfdetr import (
+                RFDETRSegNano, RFDETRSegSmall, RFDETRSegMedium,
+                RFDETRSegLarge, RFDETRSegXLarge, RFDETRSeg2XLarge,
+            )
+        except ImportError as e:
+            raise ImportError(
+                "Failed to import rfdetr. Please install it:\n"
+                "  cd repos/rf-detr && pip install -e .\n"
+                f"Original error: {e}"
+            )
 
         class_map = {
             "seg_nano": RFDETRSegNano,
@@ -116,8 +123,29 @@ class RFDETRDetector:
             from rfdetr.assets.coco_classes import COCO_CLASSES
             self.class_names = COCO_CLASSES
         except ImportError:
-            logger.warning("Could not load COCO class names from rfdetr")
-            self.class_names = [f"class_{i}" for i in range(91)]
+            # Try alternative import path
+            try:
+                import rfdetr
+                asset_dir = None
+                for path in rfdetr.__path__:
+                    candidate = os.path.join(path, "assets", "coco_classes.py")
+                    if os.path.exists(candidate):
+                        asset_dir = path
+                        break
+                if asset_dir:
+                    import importlib.util
+                    spec = importlib.util.spec_from_file_location(
+                        "coco_classes",
+                        os.path.join(asset_dir, "assets", "coco_classes.py")
+                    )
+                    mod = importlib.util.module_from_spec(spec)
+                    spec.loader.exec_module(mod)
+                    self.class_names = mod.COCO_CLASSES
+                else:
+                    raise ImportError("coco_classes.py not found in rfdetr package")
+            except Exception:
+                logger.warning("Could not load COCO class names from rfdetr")
+                self.class_names = [f"class_{i}" for i in range(91)]
 
         logger.info(f"RF-DETR model loaded successfully")
 
@@ -152,44 +180,53 @@ class RFDETRDetector:
         )
 
         objects = []
-        n_dets = len(detections.xyxy)
 
-        for i in range(min(n_dets, max_detections)):
-            bbox = detections.xyxy[i]  # (4,) xyxy
-            confidence = float(detections.confidence[i])
-            class_id = int(detections.class_id[i])
+        # Handle different RF-DETR API versions
+        # Some versions return a Detections object, others a dict or tuple
+        if hasattr(detections, 'xyxy'):
+            # supervision-style Detections object
+            n_dets = len(detections.xyxy)
+            for i in range(min(n_dets, max_detections)):
+                bbox = detections.xyxy[i]  # (4,) xyxy
+                confidence = float(detections.confidence[i])
+                class_id = int(detections.class_id[i])
 
-            # Get class name
-            if self.class_names and class_id < len(self.class_names):
-                class_name = self.class_names[class_id]
-            else:
-                class_name = f"class_{class_id}"
+                # Get class name
+                if self.class_names and class_id < len(self.class_names):
+                    class_name = self.class_names[class_id]
+                else:
+                    class_name = f"class_{class_id}"
 
-            # Get mask
-            mask = detections.mask[i] if detections.mask is not None else None
+                # Get mask
+                mask = detections.mask[i] if detections.mask is not None else None
 
-            if mask is None:
-                # Create a rectangular mask from bbox if no segmentation
-                mask = np.zeros(image.shape[:2], dtype=bool)
-                x1, y1, x2, y2 = bbox.astype(int)
-                mask[y1:y2, x1:x2] = True
+                if mask is None:
+                    # Create a rectangular mask from bbox if no segmentation
+                    mask = np.zeros(image.shape[:2], dtype=bool)
+                    x1, y1, x2, y2 = bbox.astype(int)
+                    mask[max(0,y1):min(image.shape[0],y2), max(0,x1):min(image.shape[1],x2)] = True
 
-            # Filter by minimum area
-            if mask.sum() < min_area:
-                continue
+                # Filter by minimum area
+                if mask.sum() < min_area:
+                    continue
 
-            obj = DetectedObject(
-                object_id=i,
-                class_name=class_name,
-                confidence=confidence,
-                bbox_2d=bbox.astype(np.float64),
-                mask_2d=mask,
+                obj = DetectedObject(
+                    object_id=i,
+                    class_name=class_name,
+                    confidence=confidence,
+                    bbox_2d=bbox.astype(np.float64),
+                    mask_2d=mask,
+                )
+                objects.append(obj)
+        else:
+            logger.warning(
+                f"Unexpected detection format: {type(detections)}. "
+                "RF-DETR API may have changed."
             )
-            objects.append(obj)
 
         logger.info(
             f"RF-DETR detected {len(objects)} objects "
-            f"(from {n_dets} raw detections, threshold={threshold:.2f})"
+            f"(threshold={threshold:.2f})"
         )
         return objects
 
