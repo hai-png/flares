@@ -44,3 +44,4 @@ repos/
 *.ply
 *.stl
 *.npy
+scene_recon3d/
