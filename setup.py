@@ -8,7 +8,7 @@ setup(
     description="3D Scene Reconstruction Pipeline combining RF-DETR, WildDet3D, Hunyuan3D-2.1+FlashVDM, and MARCO",
     author="Scene Recon3D",
     python_requires=">=3.10",
-    packages=find_packages(),
+    packages=find_packages(exclude=["scripts", "configs"]),
     install_requires=[
         "torch>=2.2.0",
         "torchvision>=0.17.0",
@@ -20,6 +20,7 @@ setup(
         "trimesh>=4.0",
         "einops>=0.7",
         "omegaconf>=2.3",
+        "pyyaml>=6.0",
         "tqdm>=4.65",
         "huggingface_hub>=0.19",
         "safetensors>=0.4",
@@ -35,6 +36,7 @@ setup(
             "timm>=1.0",
             "pyrender",
             "open3d>=0.18",
+            "pymeshlab",
         ],
         "dev": [
             "pytest",
@@ -42,9 +44,7 @@ setup(
             "ruff",
         ],
     },
-    entry_points={
-        "console_scripts": [
-            "scene-recon3d=scene_recon3d.run_pipeline:main",
-        ],
-    },
+    # run_pipeline.py is at the repo root, not inside the package,
+    # so we don't use entry_points for it. Run it directly:
+    #   python run_pipeline.py --image scene.jpg
 )

@@ -1,9 +1,26 @@
 #!/bin/bash
 # =============================================================
-# Setup Script for 3D Scene Reconstruction Pipeline
+# Setup Script for FLARES - 3D Scene Reconstruction Pipeline
 # =============================================================
-# This script installs all dependencies, downloads model weights,
-# and prepares the environment for the pipeline.
+# This script installs all dependencies and prepares the environment
+# for Google Colab or similar CUDA-equipped Linux environments.
+#
+# IMPORTANT: This script NEVER uses the repos' requirements.txt
+# files because they contain conflicting version pins (e.g.,
+# torch==2.5.1, numpy==1.24.4) that break other components.
+# Instead, we install known-compatible versions directly.
+#
+# Project structure:
+#   flares/                        <- repo root
+#     scene_recon3d/               <- Python package
+#       __init__.py
+#       pipeline.py
+#       modules/
+#       utils/
+#     run_pipeline.py              <- CLI entry point
+#     setup.py                     <- pip install -e .
+#     scripts/setup.sh             <- this script
+#     repos/                       <- cloned repos (git-ignored)
 #
 # Usage:
 #   bash scripts/setup.sh [--skip-download] [--skip-cuda-ext]
@@ -16,7 +33,7 @@ PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 REPOS_DIR="$PROJECT_DIR/repos"
 
 echo "============================================================"
-echo " 3D Scene Reconstruction Pipeline — Setup"
+echo " FLARES - 3D Scene Reconstruction Pipeline - Setup"
 echo "============================================================"
 echo "Project dir: $PROJECT_DIR"
 echo "Repos dir:   $REPOS_DIR"
@@ -40,7 +57,7 @@ for arg in "$@"; do
 done
 
 # ─── 1. Check Prerequisites ────────────────────────────────────
-echo "[1/7] Checking prerequisites..."
+echo "[1/8] Checking prerequisites..."
 
 if ! command -v git &> /dev/null; then
     echo "ERROR: git is not installed"
@@ -54,12 +71,20 @@ if ! $PYTHON_CMD -c "import torch" 2>/dev/null; then
 fi
 
 CUDA_VERSION=$($PYTHON_CMD -c "import torch; print(torch.version.cuda or 'cpu')" 2>/dev/null)
+TORCH_VERSION=$($PYTHON_CMD -c "import torch; print(torch.__version__)" 2>/dev/null)
+PYTHON_VERSION=$($PYTHON_CMD --version 2>&1)
+echo "  PyTorch: $TORCH_VERSION"
 echo "  PyTorch CUDA: $CUDA_VERSION"
-echo "  Python: $($PYTHON_CMD --version)"
+echo "  Python: $PYTHON_VERSION"
+
+# Record original torch version for later restore
+SAVED_TORCH_VERSION="$TORCH_VERSION"
+SAVED_TORCHVISION_VERSION=$($PYTHON_CMD -c "import torchvision; print(torchvision.__version__)" 2>/dev/null || echo "unknown")
+echo "  Saved torch==$SAVED_TORCH_VERSION, torchvision==$SAVED_TORCHVISION_VERSION"
 
 # ─── 2. Clone Repositories ─────────────────────────────────────
 echo ""
-echo "[2/7] Checking repositories..."
+echo "[2/8] Checking repositories..."
 
 REPOS=(
     "https://github.com/visinf/MARCO.git"
@@ -77,7 +102,6 @@ for repo_url in "${REPOS[@]}"; do
         git clone --recurse-submodules "$repo_url" "$REPOS_DIR/$repo_name"
     else
         echo "  ✓ $repo_name already exists"
-        # Ensure submodules are initialized for WildDet3D
         if [ "$repo_name" = "WildDet3D" ]; then
             cd "$REPOS_DIR/WildDet3D"
             git submodule update --init --recursive 2>/dev/null || true
@@ -85,91 +109,168 @@ for repo_url in "${REPOS[@]}"; do
     fi
 done
 
-# ─── 3. Install Core Python Dependencies ───────────────────────
+# ─── 3. Install Core Dependencies ─────────────────────────────
 echo ""
-echo "[3/7] Installing core Python dependencies..."
+echo "[3/8] Installing core Python dependencies..."
 
-$PYTHON_CMD -m pip install --upgrade pip
+$PYTHON_CMD -m pip install --upgrade pip setuptools wheel
 
-# Core dependencies
-$PYTHON_CMD -m pip install \
+# Install core deps without strict version pins.
+# These are shared across multiple pipeline components.
+$PYTHON_CMD -m pip install --quiet \
     omegaconf \
+    pyyaml \
     opencv-python-headless \
     pillow \
     scipy \
     scikit-image \
     trimesh \
-    pyrender \
     einops \
     tqdm \
     huggingface_hub \
     safetensors \
-    supervision
+    supervision \
+    rembg \
+    pygltflib
 
-# ─── 4. Install RF-DETR ────────────────────────────────────────
+# ─── 4. Install the scene_recon3d package ──────────────────────
 echo ""
-echo "[4/7] Installing RF-DETR..."
+echo "[4/8] Installing scene_recon3d package..."
 
-if $PYTHON_CMD -c "import rfdetr" 2>/dev/null; then
-    echo "  ✓ rfdetr already installed"
+cd "$PROJECT_DIR"
+$PYTHON_CMD -m pip install -e . --no-deps --quiet 2>/dev/null || \
+    echo "  ⚠ pip install -e . had issues (non-critical if running from repo root)"
+
+if $PYTHON_CMD -c "from scene_recon3d.pipeline import SceneReconstructionPipeline; print('OK')" 2>/dev/null; then
+    echo "  ✓ scene_recon3d package importable"
 else
-    cd "$REPOS_DIR/rf-detr"
-    $PYTHON_CMD -m pip install -e .
-    echo "  ✓ RF-DETR installed"
+    echo "  ⚠ scene_recon3d package not importable — make sure you run from the repo root"
 fi
 
-# ─── 5. Install Hunyuan3D-2.1 + FlashVDM ──────────────────────
+# ─── 5. Install RF-DETR ────────────────────────────────────────
 echo ""
-echo "[5/7] Setting up Hunyuan3D-2.1 + FlashVDM..."
+echo "[5/8] Installing RF-DETR..."
 
-# Hunyuan3D-2.1 is NOT pip-installable. It uses sys.path manipulation.
-# The repo uses nested packages: hy3dshape/hy3dshape/ and hy3dpaint/
-# We verify the directory structure and install dependencies instead.
+cd "$REPOS_DIR/rf-detr"
+# Install RF-DETR with --no-deps first to avoid its dependencies pulling
+# incompatible torch/numpy versions, then install its actual needed deps.
+$PYTHON_CMD -m pip install -e . --no-deps --quiet 2>/dev/null || \
+    echo "  ⚠ RF-DETR no-deps install had issues"
 
+# Install RF-DETR's actual runtime dependencies (without strict pins)
+$PYTHON_CMD -m pip install --quiet \
+    transformers \
+    diffusers \
+    accelerate \
+    timm \
+    supervision 2>/dev/null || true
+
+if $PYTHON_CMD -c "import rfdetr" 2>/dev/null; then
+    echo "  ✓ RF-DETR installed"
+else
+    echo "  ⚠ RF-DETR import failed (will retry after torch restore)"
+fi
+
+# ─── 6. Install Hunyuan3D-2.1 dependencies ─────────────────────
+echo ""
+echo "[6/8] Setting up Hunyuan3D-2.1 + FlashVDM..."
+
+# Verify repo structure
 HUNYUAN_DIR="$REPOS_DIR/Hunyuan3D-2.1"
 if [ -d "$HUNYUAN_DIR/hy3dshape/hy3dshape" ]; then
-    echo "  ✓ Hunyuan3D-2.1 repo structure verified (nested hy3dshape package)"
+    echo "  ✓ Hunyuan3D-2.1 repo structure verified"
 else
     echo "  ⚠ Expected Hunyuan3D-2.1 structure not found at $HUNYUAN_DIR"
 fi
 
-if [ -d "$HUNYUAN_DIR/hy3dpaint" ]; then
-    echo "  ✓ Hunyuan3D-2.1 hy3dpaint directory verified"
-else
-    echo "  ⚠ Expected hy3dpaint directory not found at $HUNYUAN_DIR/hy3dpaint"
-fi
+# Install ALL Hunyuan3D dependencies WITHOUT using their requirements.txt.
+# Their requirements.txt pins numpy==1.24.4 (broken on Python 3.12) and
+# torch==2.5.1 which downgrades Colab's torch.
+#
+# The hy3dshape package requires these imports:
+#   pipelines.py:      torch, numpy, PIL, trimesh, diffusers, transformers,
+#                       omegaconf, yaml, tqdm, huggingface_hub, safetensors, accelerate
+#   postprocessors.py:  pymeshlab, trimesh, numpy
+#   preprocessors.py:   opencv-python, einops, numpy, PIL
+#   conditioner.py:     transformers (CLIP, DINOv2), torchvision, numpy
+#   denoisers/:         torch, einops
+#   rembg.py:           rembg (optional)
+echo "  Installing Hunyuan3D-compatible dependencies (no strict pins)..."
 
-# Install Hunyuan3D Python dependencies from their requirements.txt
-if [ -f "$HUNYUAN_DIR/requirements.txt" ]; then
-    echo "  Installing Hunyuan3D dependencies from requirements.txt..."
-    $PYTHON_CMD -m pip install -r "$HUNYUAN_DIR/requirements.txt" 2>/dev/null || \
-        echo "  ⚠ Some Hunyuan3D requirements failed (non-critical)"
-else
-    echo "  Installing known Hunyuan3D dependencies..."
-    $PYTHON_CMD -m pip install \
-        transformers>=4.46.0 \
-        diffusers>=0.30.0 \
-        accelerate>=1.1.1 \
-        rembg>=2.0.50 \
-        pymeshlab \
-        xatlas \
-        open3d \
-        pygltflib \
-        basicsr \
-        realesrgan 2>/dev/null || \
-        echo "  ⚠ Some optional dependencies failed (non-critical)"
-fi
+# Core shape pipeline dependencies
+$PYTHON_CMD -m pip install --quiet \
+    pymeshlab \
+    pyyaml \
+    accelerate \
+    xatlas 2>/dev/null || {
+    echo "  ⚠ Some Hunyuan3D deps failed. Trying individually..."
+    $PYTHON_CMD -m pip install --quiet pymeshlab 2>/dev/null || echo "  ⚠ pymeshlab install failed"
+    $PYTHON_CMD -m pip install --quiet pyyaml 2>/dev/null || echo "  ⚠ pyyaml install failed"
+    $PYTHON_CMD -m pip install --quiet accelerate 2>/dev/null || echo "  ⚠ accelerate install failed"
+    $PYTHON_CMD -m pip install --quiet xatlas 2>/dev/null || echo "  ⚠ xatlas install failed"
+}
 
-# Build CUDA extensions for texture pipeline
+# Optional: open3d (for point cloud / mesh I/O)
+$PYTHON_CMD -m pip install --quiet open3d 2>/dev/null || \
+    echo "  ⚠ open3d install failed (optional)"
+
+# Quick import test for hy3dshape core
+echo "  Testing hy3dshape import..."
+$PYTHON_CMD -c "
+import sys, os
+hy3dshape_dir = os.path.join('$HUNYUAN_DIR', 'hy3dshape')
+if os.path.isdir(os.path.join(hy3dshape_dir, 'hy3dshape')):
+    sys.path.insert(0, hy3dshape_dir)
+    try:
+        from hy3dshape.pipelines import Hunyuan3DDiTFlowMatchingPipeline
+        print('  ✓ hy3dshape imports successfully')
+    except Exception as e:
+        print(f'  ✗ hy3dshape import failed: {e}')
+        # Try to identify which module is missing
+        import importlib
+        missing = []
+        for mod in ['pymeshlab', 'yaml', 'trimesh', 'diffusers', 'transformers',
+                     'einops', 'omegaconf', 'accelerate', 'huggingface_hub',
+                     'safetensors', 'cv2', 'PIL', 'tqdm']:
+            try:
+                importlib.import_module(mod)
+            except ImportError:
+                missing.append(mod)
+        if missing:
+            print(f'    Missing modules: {missing}')
+else:
+    print('  ✗ hy3dshape directory not found')
+" 2>&1
+
+# Build CUDA extensions for texture pipeline (optional - requires CUDA toolkit + ninja)
 if [ "$SKIP_CUDA_EXT" = false ]; then
-    echo "  Building CUDA rasterizer extensions..."
-    cd "$HUNYUAN_DIR/hy3dpaint/custom_rasterizer"
-    $PYTHON_CMD -m pip install -e . 2>/dev/null || \
-        echo "  ⚠ custom_rasterizer build failed (non-critical for shape-only)"
+    echo "  Building CUDA rasterizer extensions (optional, requires CUDA toolkit)..."
+    if command -v nvcc &> /dev/null; then
+        echo "    CUDA toolkit found: $(nvcc --version | grep release | head -1)"
 
-    cd "$HUNYUAN_DIR/hy3dpaint/DifferentiableRenderer"
-    bash compile_mesh_painter.sh 2>/dev/null || \
-        echo "  ⚠ DifferentiableRenderer build failed (non-critical for shape-only)"
+        # Install ninja for faster CUDA builds
+        $PYTHON_CMD -m pip install --quiet ninja 2>/dev/null || true
+
+        cd "$HUNYUAN_DIR/hy3dpaint/custom_rasterizer" 2>/dev/null
+        if [ -f "setup.py" ] || [ -f "pyproject.toml" ]; then
+            $PYTHON_CMD -m pip install -e . 2>/dev/null || \
+                echo "  ⚠ custom_rasterizer build failed (non-critical, texture pipeline will be unavailable)"
+        else
+            echo "  ⚠ custom_rasterizer setup.py/pyproject.toml not found, skipping"
+        fi
+
+        cd "$HUNYUAN_DIR/hy3dpaint/DifferentiableRenderer" 2>/dev/null
+        if [ -f "compile_mesh_painter.sh" ]; then
+            bash compile_mesh_painter.sh 2>/dev/null || \
+                echo "  ⚠ DifferentiableRenderer build failed (non-critical)"
+        else
+            echo "  ⚠ compile_mesh_painter.sh not found, skipping"
+        fi
+    else
+        echo "  ⚠ nvcc not found, skipping CUDA extension builds. Install CUDA toolkit for texture pipeline."
+    fi
+else
+    echo "  Skipping CUDA extension builds (--skip-cuda-ext)"
 fi
 
 # Download RealESRGAN weights
@@ -180,104 +281,146 @@ if [ "$SKIP_DOWNLOAD" = false ]; then
         echo "  Downloading RealESRGAN weights..."
         wget -q "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth" \
             -O "$ESRGAN_CKPT" 2>/dev/null || \
-            echo "  ⚠ RealESRGAN download failed (texture generation will be disabled)"
+            echo "  ⚠ RealESRGAN download failed"
     fi
 fi
 
-echo "  ✓ Hunyuan3D-2.1 setup complete (uses sys.path at runtime)"
+echo "  ✓ Hunyuan3D-2.1 setup complete"
 
-# ─── 6. Install WildDet3D ──────────────────────────────────────
+# ─── 7. Install WildDet3D + MARCO dependencies ────────────────
 echo ""
-echo "[6/7] Setting up WildDet3D..."
-
-# WildDet3D is NOT pip-installable. It uses sys.path manipulation.
-# The repo has a wilddet3d/ package directory with __init__.py
-# that auto-adds third_party submodules to sys.path.
-# We verify structure and install dependencies.
+echo "[7/8] Setting up WildDet3D + MARCO..."
 
 WILDDET_DIR="$REPOS_DIR/WildDet3D"
 if [ -d "$WILDDET_DIR/wilddet3d" ]; then
     echo "  ✓ WildDet3D package directory verified"
 else
-    echo "  ⚠ Expected wilddet3d package not found at $WILDDET_DIR/wilddet3d"
+    echo "  ⚠ Expected wilddet3d package not found"
 fi
 
-# Verify third_party submodules
+# Verify submodules
 for submodule in sam3 lingbot_depth; do
     if [ -d "$WILDDET_DIR/third_party/$submodule" ] && \
        [ "$(ls -A "$WILDDET_DIR/third_party/$submodule" 2>/dev/null)" ]; then
         echo "  ✓ WildDet3D third_party/$submodule populated"
     else
-        echo "  ⚠ WildDet3D third_party/$submodule is empty — initializing submodules..."
+        echo "  Initializing WildDet3D submodules..."
         cd "$WILDDET_DIR"
-        git submodule update --init --recursive 2>/dev/null || \
-            echo "  ⚠ Failed to init submodule $submodule"
+        git submodule update --init --recursive 2>/dev/null || true
     fi
 done
 
-# Install WildDet3D Python dependencies from their requirements.txt
-if [ -f "$WILDDET_DIR/requirements.txt" ]; then
-    echo "  Installing WildDet3D dependencies from requirements.txt..."
-    $PYTHON_CMD -m pip install -r "$WILDDET_DIR/requirements.txt" 2>/dev/null || \
-        echo "  ⚠ Some WildDet3D requirements failed (non-critical)"
-else
-    echo "  Installing known WildDet3D dependencies..."
-    $PYTHON_CMD -m pip install \
-        pyquaternion \
-        ftfy \
-        regex \
-        iopath \
-        pyarrow \
-        einops \
-        timm \
-        transformers 2>/dev/null || \
-        echo "  ⚠ Some WildDet3D dependencies failed"
-fi
+# Install WildDet3D dependencies WITHOUT using their requirements.txt
+echo "  Installing WildDet3D-compatible dependencies (no strict pins)..."
+$PYTHON_CMD -m pip install --quiet \
+    pyquaternion \
+    ftfy \
+    regex \
+    iopath \
+    pyarrow \
+    ml_collections \
+    terminaltables \
+    timm 2>/dev/null || true
+
+# Install utils3d (needed by WildDet3D)
+$PYTHON_CMD -m pip install --quiet \
+    "utils3d @ git+https://github.com/EasternJournalist/utils3d.git" 2>/dev/null || \
+    echo "  ⚠ utils3d install failed"
 
 # Install vis4d framework
+# NOTE: vis4d requires pydantic<2.0 but rfdetr requires pydantic>=2.0.
+# We install vis4d with --no-deps to avoid the pydantic conflict,
+# then install vis4d's other deps manually.
 if $PYTHON_CMD -c "import vis4d" 2>/dev/null; then
     echo "  ✓ vis4d already installed"
 else
-    $PYTHON_CMD -m pip install vis4d==1.0.0 2>/dev/null || \
-        echo "  ⚠ vis4d install failed"
+    echo "  Installing vis4d (with --no-deps to avoid pydantic conflict)..."
+    $PYTHON_CMD -m pip install --quiet vis4d==1.0.0 --no-deps 2>/dev/null || {
+        echo "  ⚠ vis4d install failed, trying without version pin..."
+        $PYTHON_CMD -m pip install --quiet vis4d --no-deps 2>/dev/null || \
+            echo "  ⚠ vis4d install failed completely"
+    }
 fi
 
-# Install vis4d CUDA ops
+# Install vis4d CUDA ops (optional)
 if [ "$SKIP_CUDA_EXT" = false ]; then
     if $PYTHON_CMD -c "import vis4d_cuda_ops" 2>/dev/null; then
         echo "  ✓ vis4d_cuda_ops already installed"
     else
-        $PYTHON_CMD -m pip install git+https://github.com/SysCV/vis4d_cuda_ops.git \
-            --no-build-isolation --no-cache-dir 2>/dev/null || \
-            echo "  ⚠ vis4d_cuda_ops build failed"
+        echo "  Installing vis4d_cuda_ops..."
+        $PYTHON_CMD -m pip install --quiet "git+https://github.com/SysCV/vis4d_cuda_ops.git" 2>/dev/null || \
+            echo "  ⚠ vis4d_cuda_ops build failed (non-critical)"
     fi
 fi
 
-echo "  ✓ WildDet3D setup complete (uses sys.path at runtime)"
-
-# ─── 7. Install MARCO ──────────────────────────────────────────
-echo ""
-echo "[7/7] Installing MARCO dependencies..."
-
-# MARCO is loaded via torch.hub or sys.path. Install its dependencies.
-$PYTHON_CMD -m pip install \
-    timm \
+# Install MARCO dependencies
+$PYTHON_CMD -m pip install --quiet \
     pandas \
     mediapy \
     h5py \
     scikit-learn \
     torch-kmeans \
-    gdown 2>/dev/null || \
-    echo "  ⚠ Some MARCO dependencies failed"
+    gdown 2>/dev/null || true
+
+echo "  ✓ WildDet3D + MARCO setup complete"
+
+# ─── 8. Restore torch + Reinstall RF-DETR ─────────────────────
+echo ""
+echo "[8/8] Restoring torch and reinstalling RF-DETR..."
+
+CURRENT_TORCH=$($PYTHON_CMD -c "import torch; print(torch.__version__)" 2>/dev/null || echo "none")
+
+if [ "$CURRENT_TORCH" != "$SAVED_TORCH_VERSION" ]; then
+    echo "  ⚠ torch was changed from $SAVED_TORCH_VERSION to $CURRENT_TORCH"
+    echo "  Restoring torch==$SAVED_TORCH_VERSION..."
+
+    # Determine the correct PyTorch index URL based on CUDA version
+    TORCH_INDEX="https://download.pytorch.org/whl/cu124"
+    if echo "$CUDA_VERSION" | grep -q "^12\.1"; then
+        TORCH_INDEX="https://download.pytorch.org/whl/cu121"
+    elif echo "$CUDA_VERSION" | grep -q "^11\.8"; then
+        TORCH_INDEX="https://download.pytorch.org/whl/cu118"
+    fi
+    echo "  Using PyTorch index: $TORCH_INDEX"
+
+    $PYTHON_CMD -m pip install --quiet \
+        torch=="$SAVED_TORCH_VERSION" \
+        torchvision=="$SAVED_TORCHVISION_VERSION" \
+        --index-url "$TORCH_INDEX" 2>/dev/null || {
+        echo "  Exact version restore failed, installing latest compatible..."
+        $PYTHON_CMD -m pip install --quiet torch torchvision \
+            --index-url "$TORCH_INDEX"
+    }
+
+    echo "  ✓ torch restored to $($PYTHON_CMD -c "import torch; print(torch.__version__)")"
+else
+    echo "  ✓ torch version unchanged ($CURRENT_TORCH)"
+fi
+
+# Reinstall RF-DETR with restored torch
+echo "  Reinstalling RF-DETR with current torch..."
+cd "$REPOS_DIR/rf-detr"
+$PYTHON_CMD -m pip install -e . --no-deps --quiet 2>/dev/null || \
+    echo "  ⚠ RF-DETR reinstall had issues"
+
+# Ensure pydantic >= 2.0 for rfdetr
+$PYTHON_CMD -m pip install --quiet "pydantic>=2.0" 2>/dev/null || \
+    echo "  ⚠ pydantic upgrade failed"
+
+if $PYTHON_CMD -c "import rfdetr" 2>/dev/null; then
+    echo "  ✓ RF-DETR installed successfully"
+else
+    echo "  ⚠ RF-DETR import still failing"
+fi
 
 # ─── Download Model Weights ────────────────────────────────────
 if [ "$SKIP_DOWNLOAD" = false ]; then
     echo ""
     echo "Downloading model weights..."
 
-    # WildDet3D checkpoint
     CKPT_DIR="$PROJECT_DIR/ckpt"
     mkdir -p "$CKPT_DIR"
+
     if [ ! -f "$CKPT_DIR/wilddet3d_alldata_all_prompt_v1.0.pt" ]; then
         echo "  Downloading WildDet3D checkpoint (~2GB)..."
         $PYTHON_CMD -c "
@@ -287,56 +430,101 @@ hf_hub_download(
     'wilddet3d_alldata_all_prompt_v1.0.pt',
     local_dir='$CKPT_DIR'
 )
-" 2>/dev/null || echo "  ⚠ WildDet3D download failed. Run manually: huggingface-cli download allenai/WildDet3D wilddet3d_alldata_all_prompt_v1.0.pt --local-dir ckpt/"
+" 2>/dev/null || echo "  ⚠ WildDet3D download failed"
     else
         echo "  ✓ WildDet3D checkpoint already exists"
     fi
 
-    # MARCO checkpoint (optional, torch.hub auto-downloads)
-    if [ ! -f "$CKPT_DIR/marco_release.pth" ]; then
-        echo "  MARCO checkpoint will be auto-downloaded via torch.hub on first use"
-    else
-        echo "  ✓ MARCO checkpoint already exists"
-    fi
-
-    # Hunyuan3D models are auto-downloaded from HuggingFace on first use
+    echo "  MARCO checkpoint will be auto-downloaded via torch.hub on first use"
     echo "  Hunyuan3D-2.1 models will be auto-downloaded from HuggingFace on first use"
     echo "  RF-DETR models will be auto-downloaded on first use"
 fi
 
-# ─── Final Checks ──────────────────────────────────────────────
+# ─── Final Verification ────────────────────────────────────────
 echo ""
 echo "============================================================"
 echo " Setup Complete!"
 echo "============================================================"
 echo ""
-echo "Installed packages:"
+echo "Verification:"
+
 $PYTHON_CMD -c "
-import sys
-sys.path.insert(0, '$REPOS_DIR/Hunyuan3D-2.1/hy3dshape')
-sys.path.insert(0, '$REPOS_DIR/WildDet3D')
+import sys, os
+
+# Add project root to path
+project_dir = '$PROJECT_DIR'
+if project_dir not in sys.path:
+    sys.path.insert(0, project_dir)
+
+repos_dir = '$REPOS_DIR'
+
+# WildDet3D
+wilddet_dir = os.path.join(repos_dir, 'WildDet3D')
+if os.path.isdir(os.path.join(wilddet_dir, 'wilddet3d')):
+    sys.path.insert(0, wilddet_dir)
+    for sub in ['sam3', 'lingbot_depth', 'moge']:
+        p = os.path.join(wilddet_dir, 'third_party', sub)
+        if os.path.isdir(p):
+            sys.path.insert(0, p)
+
+# Hunyuan3D-2.1
+hunyuan_dir = os.path.join(repos_dir, 'Hunyuan3D-2.1')
+hy3dshape_dir = os.path.join(hunyuan_dir, 'hy3dshape')
+hy3dpaint_dir = os.path.join(hunyuan_dir, 'hy3dpaint')
+if os.path.isdir(os.path.join(hy3dshape_dir, 'hy3dshape')):
+    sys.path.insert(0, hy3dshape_dir)
+if os.path.isdir(hy3dpaint_dir):
+    sys.path.insert(0, hy3dpaint_dir)
+
+# MARCO
+marco_dir = os.path.join(repos_dir, 'MARCO')
+if os.path.isdir(marco_dir):
+    sys.path.insert(0, marco_dir)
+
+# Test imports
+try:
+    from scene_recon3d.pipeline import SceneReconstructionPipeline
+    print('  ✓ scene_recon3d package')
+except Exception as e:
+    print(f'  ✗ scene_recon3d package: {e}')
 
 try:
-    import rfdetr; print(f'  ✓ RF-DETR')
-except: print('  ✗ RF-DETR not installed')
+    import rfdetr
+    print('  ✓ RF-DETR')
+except Exception as e:
+    print(f'  ✗ RF-DETR: {e}')
 
 try:
-    from hy3dshape.pipelines import Hunyuan3DDiTFlowMatchingPipeline; print('  ✓ Hunyuan3D-Shape')
-except: print('  ✗ Hunyuan3D-Shape not available')
+    from hy3dshape.pipelines import Hunyuan3DDiTFlowMatchingPipeline
+    print('  ✓ Hunyuan3D-Shape')
+except Exception as e:
+    print(f'  ✗ Hunyuan3D-Shape: {e}')
 
 try:
-    from textureGenPipeline import Hunyuan3DPaintPipeline; print('  ✓ Hunyuan3D-Paint')
-except: print('  ✗ Hunyuan3D-Paint not available (optional)')
+    from textureGenPipeline import Hunyuan3DPaintPipeline
+    print('  ✓ Hunyuan3D-Paint')
+except Exception as e:
+    print(f'  ✗ Hunyuan3D-Paint (optional): {e}')
 
 try:
-    from wilddet3d import build_model; print('  ✓ WildDet3D')
-except: print('  ✗ WildDet3D not available')
-" 2>/dev/null
+    from wilddet3d import build_model
+    print('  ✓ WildDet3D')
+except Exception as e:
+    print(f'  ✗ WildDet3D: {e}')
+
+import torch
+import numpy as np
+print(f'  ✓ torch {torch.__version__} + numpy {np.__version__}')
+if torch.cuda.is_available():
+    print(f'  ✓ CUDA: {torch.cuda.get_device_name(0)}')
+else:
+    print('  ⚠ CUDA not available')
+" 2>&1
 
 echo ""
 echo "To run the pipeline:"
 echo "  cd $PROJECT_DIR"
 echo "  python run_pipeline.py --image <path_to_image> --preload"
 echo ""
-echo "To run with custom config:"
-echo "  python run_pipeline.py --image <path_to_image> --config configs/pipeline_config.yaml"
+echo "To check environment only:"
+echo "  python run_pipeline.py --check-env"

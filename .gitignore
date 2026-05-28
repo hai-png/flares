@@ -44,4 +44,4 @@ repos/
 *.ply
 *.stl
 *.npy
-scene_recon3d/
+# scene_recon3d/ is our package, do NOT ignore it
