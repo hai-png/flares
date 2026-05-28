@@ -64,19 +64,60 @@ class WildDet3DEstimator:
         self.device = device
         self.model = None
 
-    def load_model(self):
-        """Load the WildDet3D model and weights.
+    def _setup_paths(self):
+        """Add WildDet3D directories to sys.path.
 
-        Requires the WildDet3D package to be installed and the
-        checkpoint file to be available. Downloads from HuggingFace
-        if not present.
+        WildDet3D is NOT pip-installable. It uses sys.path manipulation.
+        The repo has a wilddet3d/ package directory with __init__.py
+        that auto-adds third_party submodules to sys.path on import.
+        We also add third_party dirs manually as a fallback.
         """
-        # Add WildDet3D repo to path if needed
         repo_path = os.path.join(
             os.path.dirname(__file__), "..", "..", "repos", "WildDet3D"
         )
-        if os.path.exists(repo_path) and repo_path not in sys.path:
-            sys.path.insert(0, repo_path)
+        repo_path = os.path.abspath(repo_path)
+
+        # Support FLARES_REPO_DIR env var for custom locations
+        env_repo = os.environ.get("FLARES_REPO_DIR", "")
+        search_paths = [repo_path]
+        if env_repo:
+            search_paths.insert(0, os.path.join(env_repo, "WildDet3D"))
+
+        for candidate in search_paths:
+            if os.path.isdir(os.path.join(candidate, "wilddet3d")):
+                if candidate not in sys.path:
+                    sys.path.insert(0, candidate)
+                    logger.info(f"Added to sys.path: {candidate}")
+
+                # Also add third_party dirs for submodule imports
+                # (wilddet3d/__init__.py does this too, but pre-add
+                # in case __init__.py import fails partially)
+                for submodule in ["sam3", "lingbot_depth", "moge"]:
+                    sub_path = os.path.join(candidate, "third_party", submodule)
+                    if os.path.isdir(sub_path) and sub_path not in sys.path:
+                        sys.path.insert(0, sub_path)
+                        logger.info(f"Added to sys.path: {sub_path}")
+
+                return True
+
+        return False
+
+    def load_model(self):
+        """Load the WildDet3D model and weights.
+
+        WildDet3D uses sys.path manipulation (not pip install).
+        The repo root must be on sys.path for `from wilddet3d import ...`
+        to work. The __init__.py auto-adds third_party submodules.
+
+        Downloads checkpoint from HuggingFace if not present.
+        """
+        # Setup sys.path for WildDet3D imports
+        found = self._setup_paths()
+        if not found:
+            logger.warning(
+                "WildDet3D repo not found in expected locations. "
+                "Set FLARES_REPO_DIR environment variable to the repos directory."
+            )
 
         # Check for checkpoint
         if not os.path.exists(self.checkpoint):
@@ -93,12 +134,14 @@ class WildDet3DEstimator:
 
         try:
             from wilddet3d import build_model
-        except ImportError:
+        except ImportError as e:
             raise ImportError(
-                "WildDet3D is not installed. Please install it:\n"
-                "  cd repos/WildDet3D && pip install -e .\n"
-                "  pip install vis4d==1.0.0\n"
-                "  pip install git+https://github.com/SysCV/vis4d_cuda_ops.git --no-build-isolation"
+                "Failed to import WildDet3D. The repo uses sys.path, not pip install.\n"
+                "Make sure the repo is cloned with submodules:\n"
+                "  git clone --recurse-submodules https://github.com/allenai/WildDet3D.git repos/WildDet3D\n"
+                "The pipeline auto-adds repos/WildDet3D to sys.path.\n"
+                "Also install dependencies: pip install vis4d einops timm transformers\n"
+                f"Original error: {e}"
             )
 
         logger.info("Loading WildDet3D model...")
