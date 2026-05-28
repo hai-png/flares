@@ -139,6 +139,47 @@ class Hunyuan3DGenerator:
 
         return False
 
+    def _ensure_model_downloaded(self):
+        """Ensure Hunyuan3D model weights are fully downloaded.
+
+        Hunyuan3D's smart_load_model() only checks if the model *directory* exists,
+        not whether the actual checkpoint file is present inside it. If a partial
+        download left an empty/incomplete directory, the download is skipped and
+        from_single_file() raises FileNotFoundError.
+
+        This method pre-downloads the model using huggingface_hub.snapshot_download
+        to guarantee all required files are present before from_pretrained() is called.
+        """
+        from huggingface_hub import snapshot_download
+
+        base_dir = os.environ.get("HY3DGEN_MODELS", os.path.expanduser("~/.cache/hy3dgen"))
+        model_dir = os.path.expanduser(os.path.join(base_dir, self.model_path, self.subfolder))
+
+        # Check if the checkpoint file actually exists (not just the directory)
+        ckpt_path = os.path.join(model_dir, "model.fp16.ckpt")
+        config_path = os.path.join(model_dir, "config.yaml")
+
+        if os.path.isfile(ckpt_path) and os.path.isfile(config_path):
+            logger.info(f"Hunyuan3D model already cached at {model_dir}")
+            return
+
+        logger.info(f"Downloading Hunyuan3D model weights from HuggingFace ({self.model_path})...")
+        logger.info("This may take several minutes on first run (~5GB for shape model).")
+
+        try:
+            local_dir = os.path.expanduser(os.path.join(base_dir, self.model_path))
+            snapshot_download(
+                repo_id=self.model_path,
+                allow_patterns=[f"{self.subfolder}/*"],
+                local_dir=local_dir,
+            )
+            logger.info("Hunyuan3D model weights downloaded successfully")
+        except Exception as e:
+            logger.warning(
+                f"Hunyuan3D model auto-download failed: {e}. "
+                "Will try from_pretrained() which may also attempt the download."
+            )
+
     def load_model(self):
         """Load the Hunyuan3D-2.1 shape and texture pipelines.
 
@@ -155,6 +196,12 @@ class Hunyuan3DGenerator:
 
         # Set environment variable for model cache
         os.environ.setdefault("HY3DGEN_MODELS", os.path.expanduser("~/.cache/hy3dgen"))
+
+        # Pre-download model weights to avoid smart_load_model partial-cache bug
+        try:
+            self._ensure_model_downloaded()
+        except Exception as e:
+            logger.warning(f"Model pre-download check failed: {e}")
 
         dtype_map = {
             "float16": torch.float16,

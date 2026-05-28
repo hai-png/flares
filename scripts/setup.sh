@@ -445,8 +445,36 @@ hf_hub_download(
     fi
 
     echo "  MARCO checkpoint will be auto-downloaded via torch.hub on first use"
-    echo "  Hunyuan3D-2.1 models will be auto-downloaded from HuggingFace on first use"
     echo "  RF-DETR models will be auto-downloaded on first use"
+
+    # Pre-download Hunyuan3D-2.1 model weights (optional but recommended)
+    # Hunyuan3D's smart_load_model has a bug: if the cache directory exists but
+    # the actual checkpoint file is missing (partial download), it skips re-downloading.
+    # We pre-download here to avoid that issue at runtime.
+    echo "  Pre-downloading Hunyuan3D-2.1 model weights (~5GB, may take several minutes)..."
+    $PYTHON_CMD -c "
+import os, sys
+from huggingface_hub import snapshot_download
+
+base_dir = os.environ.get('HY3DGEN_MODELS', os.path.expanduser('~/.cache/hy3dgen'))
+model_path = 'tencent/Hunyuan3D-2.1'
+subfolder = 'hunyuan3d-dit-v2-1'
+model_dir = os.path.expanduser(os.path.join(base_dir, model_path, subfolder))
+ckpt_path = os.path.join(model_dir, 'model.fp16.ckpt')
+config_path = os.path.join(model_dir, 'config.yaml')
+
+if os.path.isfile(ckpt_path) and os.path.isfile(config_path):
+    print(f'  ✓ Hunyuan3D-2.1 shape model already cached')
+else:
+    print(f'  Downloading {model_path} (subfolder: {subfolder})...')
+    local_dir = os.path.expanduser(os.path.join(base_dir, model_path))
+    snapshot_download(
+        repo_id=model_path,
+        allow_patterns=[f'{subfolder}/*'],
+        local_dir=local_dir,
+    )
+    print(f'  ✓ Hunyuan3D-2.1 shape model downloaded')
+" 2>/dev/null || echo "  ⚠ Hunyuan3D-2.1 model pre-download failed (will retry at runtime)"
 fi
 
 # ─── Final Verification ────────────────────────────────────────
