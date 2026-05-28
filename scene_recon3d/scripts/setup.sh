@@ -77,6 +77,11 @@ for repo_url in "${REPOS[@]}"; do
         git clone --recurse-submodules "$repo_url" "$REPOS_DIR/$repo_name"
     else
         echo "  ✓ $repo_name already exists"
+        # Ensure submodules are initialized for WildDet3D
+        if [ "$repo_name" = "WildDet3D" ]; then
+            cd "$REPOS_DIR/WildDet3D"
+            git submodule update --init --recursive 2>/dev/null || true
+        fi
     fi
 done
 
@@ -115,56 +120,61 @@ fi
 
 # ─── 5. Install Hunyuan3D-2.1 + FlashVDM ──────────────────────
 echo ""
-echo "[5/7] Installing Hunyuan3D-2.1..."
+echo "[5/7] Setting up Hunyuan3D-2.1 + FlashVDM..."
 
-# Install Hunyuan3D shape pipeline
-if $PYTHON_CMD -c "import hy3dshape" 2>/dev/null; then
-    echo "  ✓ hy3dshape already installed"
+# Hunyuan3D-2.1 is NOT pip-installable. It uses sys.path manipulation.
+# The repo uses nested packages: hy3dshape/hy3dshape/ and hy3dpaint/
+# We verify the directory structure and install dependencies instead.
+
+HUNYUAN_DIR="$REPOS_DIR/Hunyuan3D-2.1"
+if [ -d "$HUNYUAN_DIR/hy3dshape/hy3dshape" ]; then
+    echo "  ✓ Hunyuan3D-2.1 repo structure verified (nested hy3dshape package)"
 else
-    cd "$REPOS_DIR/Hunyuan3D-2.1/hy3dshape"
-    $PYTHON_CMD -m pip install -e .
-    echo "  ✓ hy3dshape installed"
+    echo "  ⚠ Expected Hunyuan3D-2.1 structure not found at $HUNYUAN_DIR"
 fi
 
-# Install Hunyuan3D texture pipeline
-if $PYTHON_CMD -c "import hy3dpaint" 2>/dev/null; then
-    echo "  ✓ hy3dpaint already installed"
+if [ -d "$HUNYUAN_DIR/hy3dpaint" ]; then
+    echo "  ✓ Hunyuan3D-2.1 hy3dpaint directory verified"
 else
-    cd "$REPOS_DIR/Hunyuan3D-2.1/hy3dpaint"
-    $PYTHON_CMD -m pip install -e . 2>/dev/null || \
-        echo "  ⚠ hy3dpaint install had warnings (may need CUDA extensions)"
-    echo "  ✓ hy3dpaint installed"
+    echo "  ⚠ Expected hy3dpaint directory not found at $HUNYUAN_DIR/hy3dpaint"
 fi
 
-# Install additional Hunyuan3D dependencies
-$PYTHON_CMD -m pip install \
-    transformers>=4.46.0 \
-    diffusers>=0.30.0 \
-    accelerate>=1.1.1 \
-    rembg>=2.0.50 \
-    pymeshlab \
-    xatlas \
-    open3d \
-    pygltflib \
-    basicsr \
-    realesrgan 2>/dev/null || \
-    echo "  ⚠ Some optional dependencies failed (non-critical)"
+# Install Hunyuan3D Python dependencies from their requirements.txt
+if [ -f "$HUNYUAN_DIR/requirements.txt" ]; then
+    echo "  Installing Hunyuan3D dependencies from requirements.txt..."
+    $PYTHON_CMD -m pip install -r "$HUNYUAN_DIR/requirements.txt" 2>/dev/null || \
+        echo "  ⚠ Some Hunyuan3D requirements failed (non-critical)"
+else
+    echo "  Installing known Hunyuan3D dependencies..."
+    $PYTHON_CMD -m pip install \
+        transformers>=4.46.0 \
+        diffusers>=0.30.0 \
+        accelerate>=1.1.1 \
+        rembg>=2.0.50 \
+        pymeshlab \
+        xatlas \
+        open3d \
+        pygltflib \
+        basicsr \
+        realesrgan 2>/dev/null || \
+        echo "  ⚠ Some optional dependencies failed (non-critical)"
+fi
 
 # Build CUDA extensions for texture pipeline
 if [ "$SKIP_CUDA_EXT" = false ]; then
     echo "  Building CUDA rasterizer extensions..."
-    cd "$REPOS_DIR/Hunyuan3D-2.1/hy3dpaint/custom_rasterizer"
+    cd "$HUNYUAN_DIR/hy3dpaint/custom_rasterizer"
     $PYTHON_CMD -m pip install -e . 2>/dev/null || \
         echo "  ⚠ custom_rasterizer build failed (non-critical for shape-only)"
 
-    cd "$REPOS_DIR/Hunyuan3D-2.1/hy3dpaint/DifferentiableRenderer"
+    cd "$HUNYUAN_DIR/hy3dpaint/DifferentiableRenderer"
     bash compile_mesh_painter.sh 2>/dev/null || \
         echo "  ⚠ DifferentiableRenderer build failed (non-critical for shape-only)"
 fi
 
 # Download RealESRGAN weights
 if [ "$SKIP_DOWNLOAD" = false ]; then
-    ESRGAN_CKPT="$REPOS_DIR/Hunyuan3D-2.1/hy3dpaint/ckpt/RealESRGAN_x4plus.pth"
+    ESRGAN_CKPT="$HUNYUAN_DIR/hy3dpaint/ckpt/RealESRGAN_x4plus.pth"
     if [ ! -f "$ESRGAN_CKPT" ]; then
         mkdir -p "$(dirname "$ESRGAN_CKPT")"
         echo "  Downloading RealESRGAN weights..."
@@ -174,9 +184,55 @@ if [ "$SKIP_DOWNLOAD" = false ]; then
     fi
 fi
 
+echo "  ✓ Hunyuan3D-2.1 setup complete (uses sys.path at runtime)"
+
 # ─── 6. Install WildDet3D ──────────────────────────────────────
 echo ""
-echo "[6/7] Installing WildDet3D..."
+echo "[6/7] Setting up WildDet3D..."
+
+# WildDet3D is NOT pip-installable. It uses sys.path manipulation.
+# The repo has a wilddet3d/ package directory with __init__.py
+# that auto-adds third_party submodules to sys.path.
+# We verify structure and install dependencies.
+
+WILDDET_DIR="$REPOS_DIR/WildDet3D"
+if [ -d "$WILDDET_DIR/wilddet3d" ]; then
+    echo "  ✓ WildDet3D package directory verified"
+else
+    echo "  ⚠ Expected wilddet3d package not found at $WILDDET_DIR/wilddet3d"
+fi
+
+# Verify third_party submodules
+for submodule in sam3 lingbot_depth; do
+    if [ -d "$WILDDET_DIR/third_party/$submodule" ] && \
+       [ "$(ls -A "$WILDDET_DIR/third_party/$submodule" 2>/dev/null)" ]; then
+        echo "  ✓ WildDet3D third_party/$submodule populated"
+    else
+        echo "  ⚠ WildDet3D third_party/$submodule is empty — initializing submodules..."
+        cd "$WILDDET_DIR"
+        git submodule update --init --recursive 2>/dev/null || \
+            echo "  ⚠ Failed to init submodule $submodule"
+    fi
+done
+
+# Install WildDet3D Python dependencies from their requirements.txt
+if [ -f "$WILDDET_DIR/requirements.txt" ]; then
+    echo "  Installing WildDet3D dependencies from requirements.txt..."
+    $PYTHON_CMD -m pip install -r "$WILDDET_DIR/requirements.txt" 2>/dev/null || \
+        echo "  ⚠ Some WildDet3D requirements failed (non-critical)"
+else
+    echo "  Installing known WildDet3D dependencies..."
+    $PYTHON_CMD -m pip install \
+        pyquaternion \
+        ftfy \
+        regex \
+        iopath \
+        pyarrow \
+        einops \
+        timm \
+        transformers 2>/dev/null || \
+        echo "  ⚠ Some WildDet3D dependencies failed"
+fi
 
 # Install vis4d framework
 if $PYTHON_CMD -c "import vis4d" 2>/dev/null; then
@@ -197,19 +253,13 @@ if [ "$SKIP_CUDA_EXT" = false ]; then
     fi
 fi
 
-# Install WildDet3D dependencies
-$PYTHON_CMD -m pip install \
-    pyquaternion \
-    ftfy \
-    regex \
-    iopath \
-    pyarrow 2>/dev/null || \
-    echo "  ⚠ Some WildDet3D dependencies failed"
+echo "  ✓ WildDet3D setup complete (uses sys.path at runtime)"
 
 # ─── 7. Install MARCO ──────────────────────────────────────────
 echo ""
-echo "[7/7] Installing MARCO..."
+echo "[7/7] Installing MARCO dependencies..."
 
+# MARCO is loaded via torch.hub or sys.path. Install its dependencies.
 $PYTHON_CMD -m pip install \
     timm \
     pandas \
@@ -262,21 +312,25 @@ echo "============================================================"
 echo ""
 echo "Installed packages:"
 $PYTHON_CMD -c "
+import sys
+sys.path.insert(0, '$REPOS_DIR/Hunyuan3D-2.1/hy3dshape')
+sys.path.insert(0, '$REPOS_DIR/WildDet3D')
+
 try:
-    import rfdetr; print(f'  ✓ RF-DETR {rfdetr.__version__}')
+    import rfdetr; print(f'  ✓ RF-DETR')
 except: print('  ✗ RF-DETR not installed')
 
 try:
-    import hy3dshape; print('  ✓ Hunyuan3D-Shape')
-except: print('  ✗ Hunyuan3D-Shape not installed')
+    from hy3dshape.pipelines import Hunyuan3DDiTFlowMatchingPipeline; print('  ✓ Hunyuan3D-Shape')
+except: print('  ✗ Hunyuan3D-Shape not available')
 
 try:
-    import hy3dpaint; print('  ✓ Hunyuan3D-Paint')
-except: print('  ✗ Hunyuan3D-Paint not installed (optional)')
+    from textureGenPipeline import Hunyuan3DPaintPipeline; print('  ✓ Hunyuan3D-Paint')
+except: print('  ✗ Hunyuan3D-Paint not available (optional)')
 
 try:
-    from flashvdm_decoder.volume_decoders import FlashVDMVolumeDecoding; print('  ✓ FlashVDM')
-except: print('  ✗ FlashVDM not available')
+    from wilddet3d import build_model; print('  ✓ WildDet3D')
+except: print('  ✗ WildDet3D not available')
 " 2>/dev/null
 
 echo ""

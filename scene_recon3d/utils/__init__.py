@@ -1,5 +1,8 @@
 """Utility modules for 3D scene reconstruction pipeline."""
 
+# Auto-setup repo paths on import (ensures WildDet3D, Hunyuan3D imports work)
+from . import setup_paths  # noqa: F401 — side-effect import
+
 from .geometry import (
     quaternion_to_rotation_matrix,
     rotation_matrix_to_quaternion,

@@ -103,23 +103,54 @@ class Hunyuan3DGenerator:
         self.paint_pipeline = None
         self.rembg = None
 
+    def _setup_paths(self):
+        """Add Hunyuan3D-2.1 directories to sys.path.
+
+        Hunyuan3D-2.1 is NOT pip-installable. It uses sys.path manipulation:
+        - ./hy3dshape must be on sys.path for `from hy3dshape.pipelines import ...`
+        - ./hy3dpaint must be on sys.path for `from textureGenPipeline import ...`
+        The hy3dshape dir contains a nested package: hy3dshape/hy3dshape/
+        """
+        repo_path = os.path.join(
+            os.path.dirname(__file__), "..", "..", "repos", "Hunyuan3D-2.1"
+        )
+        repo_path = os.path.abspath(repo_path)
+
+        # Check common locations: ./repos/Hunyuan3D-2.1 and ./repos/Hunyuan3D-2.1
+        # Also support FLARES_REPO_DIR env var for custom locations
+        env_repo = os.environ.get("FLARES_REPO_DIR", "")
+        search_paths = [repo_path]
+        if env_repo:
+            search_paths.insert(0, os.path.join(env_repo, "Hunyuan3D-2.1"))
+
+        for candidate in search_paths:
+            hy3dshape_dir = os.path.join(candidate, "hy3dshape")
+            hy3dpaint_dir = os.path.join(candidate, "hy3dpaint")
+            if os.path.isdir(os.path.join(hy3dshape_dir, "hy3dshape")):
+                # Found the nested package structure: hy3dshape/hy3dshape/
+                if hy3dshape_dir not in sys.path:
+                    sys.path.insert(0, hy3dshape_dir)
+                    logger.info(f"Added to sys.path: {hy3dshape_dir}")
+                if hy3dpaint_dir not in sys.path:
+                    sys.path.insert(0, hy3dpaint_dir)
+                    logger.info(f"Added to sys.path: {hy3dpaint_dir}")
+                return True
+
+        return False
+
     def load_model(self):
         """Load the Hunyuan3D-2.1 shape and texture pipelines.
 
         Downloads pretrained weights from HuggingFace on first use.
         Weights are cached at ~/.cache/hy3dgen/.
         """
-        # Add Hunyuan3D repo to path if needed
-        repo_path = os.path.join(
-            os.path.dirname(__file__), "..", "..", "repos", "Hunyuan3D-2.1"
-        )
-        if os.path.exists(repo_path):
-            for sub in ["hy3dshape", "hy3dpaint"]:
-                sub_path = os.path.join(repo_path, sub)
-                if os.path.exists(sub_path) and sub_path not in sys.path:
-                    sys.path.insert(0, sub_path)
-            if repo_path not in sys.path:
-                sys.path.insert(0, repo_path)
+        # Setup sys.path for Hunyuan3D imports
+        found = self._setup_paths()
+        if not found:
+            logger.warning(
+                "Hunyuan3D-2.1 repo not found in expected locations. "
+                "Set FLARES_REPO_DIR environment variable to the repos directory."
+            )
 
         # Set environment variable for model cache
         os.environ.setdefault("HY3DGEN_MODELS", os.path.expanduser("~/.cache/hy3dgen"))
@@ -135,11 +166,13 @@ class Hunyuan3DGenerator:
         logger.info("Loading Hunyuan3D-2.1 shape pipeline...")
         try:
             from hy3dshape.pipelines import Hunyuan3DDiTFlowMatchingPipeline
-        except ImportError:
+        except ImportError as e:
             raise ImportError(
-                "Hunyuan3D-2.1 is not installed. Please install it:\n"
-                "  cd repos/Hunyuan3D-2.1/hy3dshape && pip install -e .\n"
-                "  cd repos/Hunyuan3D-2.1/hy3dpaint && pip install -e ."
+                "Failed to import Hunyuan3D-2.1. The repo uses sys.path, not pip install.\n"
+                "Make sure the repos are cloned:\n"
+                "  git clone https://github.com/Tencent-Hunyuan/Hunyuan3D-2.1.git repos/Hunyuan3D-2.1\n"
+                "The pipeline auto-adds repos/Hunyuan3D-2.1/hy3dshape and hy3dpaint to sys.path.\n"
+                f"Original error: {e}"
             )
 
         self.shape_pipeline = Hunyuan3DDiTFlowMatchingPipeline.from_pretrained(
