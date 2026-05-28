@@ -210,6 +210,23 @@ $PYTHON_CMD -m pip install --quiet \
     $PYTHON_CMD -m pip install --quiet xatlas 2>/dev/null || echo "  ⚠ xatlas install failed"
 }
 
+# Install OpenGL library to suppress pymeshlab plugin warnings
+# (pymeshlab plugins like libfilter_ao.so need libOpenGL.so.0)
+if ! ldconfig -p 2>/dev/null | grep -q "libOpenGL.so.0"; then
+    $PYTHON_CMD -c "
+import subprocess, sys
+try:
+    # Try apt (Ubuntu/Debian)
+    subprocess.run(['apt-get', 'install', '-y', 'libopengl0'], check=True, capture_output=True)
+except Exception:
+    try:
+        # Try conda
+        subprocess.run(['conda', 'install', '-y', 'libopengl0'], check=True, capture_output=True)
+    except Exception:
+        print('  ⚠ Could not install libopengl0 (pymeshlab will show warnings)')
+" 2>/dev/null || true
+fi
+
 # Optional: open3d (for point cloud / mesh I/O)
 $PYTHON_CMD -m pip install --quiet open3d 2>/dev/null || \
     echo "  ⚠ open3d install failed (optional)"
@@ -320,7 +337,10 @@ $PYTHON_CMD -m pip install --quiet \
     pyarrow \
     ml_collections \
     terminaltables \
-    timm 2>/dev/null || true
+    timm \
+    pycocotools \
+    scalabel \
+    cloudpickle 2>/dev/null || true
 
 # Install utils3d (needed by WildDet3D)
 $PYTHON_CMD -m pip install --quiet \

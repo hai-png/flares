@@ -24,6 +24,28 @@ if _this_dir not in sys.path:
 import numpy as np
 
 
+def _suppress_pymeshlab_warnings():
+    """Import pymeshlab while suppressing noisy plugin-loading warnings.
+
+    When libOpenGL.so.0 is missing, pymeshlab prints ~40 lines of warnings
+    about plugins that cannot load. These plugins are optional and not used
+    by our pipeline. Since pymeshlab prints via print() in its __init__.py,
+    we redirect stdout during import.
+    """
+    import io
+    old_stdout = sys.stdout
+    sys.stdout = io.StringIO()
+    try:
+        import pymeshlab  # noqa: F401
+    except ImportError:
+        pass
+    finally:
+        sys.stdout = old_stdout
+
+
+_suppress_pymeshlab_warnings()
+
+
 def setup_logging(level: str = "INFO"):
     """Configure logging for the pipeline."""
     logging.basicConfig(
