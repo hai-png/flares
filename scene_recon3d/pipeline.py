@@ -152,7 +152,7 @@ class SceneReconstructionPipeline:
             save_intermediate: Save intermediate results
             render_resolution: Resolution for mesh rendering
             min_object_area: Minimum mask area to process an object
-            low_vram_mode: Load/unload models stage-by-stage to fit in 15GB VRAM
+            low_vram_mode: Load/unload models stage-by-stage to reduce peak GPU memory
         """
         self.device = device
         self.output_dir = output_dir
@@ -342,15 +342,17 @@ class SceneReconstructionPipeline:
 
         In low_vram_mode (default True), models are loaded stage-by-stage
         during pipeline execution and unloaded after each stage completes.
-        This keeps GPU memory usage under ~10GB to fit on T4 (15GB VRAM).
+        This keeps peak GPU memory significantly lower than loading all
+        models at once.
 
-        When low_vram_mode=False, all models are loaded at once (needs ~25GB VRAM).
+        When low_vram_mode=False, all models are loaded at once (requires
+        sufficient GPU memory for all models simultaneously).
         """
         if self.low_vram_mode:
             logger.info(
                 "Low VRAM mode enabled — models will be loaded/unloaded "
                 "stage-by-stage during pipeline execution. "
-                "This keeps GPU usage under ~10GB for T4 compatibility."
+                "This keeps peak GPU usage low for broader hardware compatibility."
             )
             # Do a quick import check to verify all modules are importable,
             # but don't actually load the heavy model weights.
@@ -374,7 +376,7 @@ class SceneReconstructionPipeline:
                 logger.error(f"  ✗ Hunyuan3D not importable: {e}")
             logger.info("Low VRAM mode ready — models will load on demand")
         else:
-            logger.info("Pre-loading all pipeline models (requires ~25GB VRAM)...")
+            logger.info("Pre-loading all pipeline models (requires enough VRAM for all models)...")
             logger.info("[1/4] Loading RF-DETR...")
             self.detector.load_model()
             logger.info("[2/4] Loading WildDet3D...")
@@ -603,6 +605,8 @@ class SceneReconstructionPipeline:
                 bbox_center=obj.bbox_3d_center,
                 bbox_dims=obj.bbox_3d_dims,
                 bbox_quat=obj.bbox_3d_quat,
+                camera_intrinsics=camera_intrinsics,
+                bbox_2d=obj.bbox_2d,
             )
 
             obj.aligned_mesh = aligned_mesh

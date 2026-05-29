@@ -37,7 +37,7 @@ class Hunyuan3DGenerator:
     Takes masked object images and generates high-fidelity 3D meshes
     with optional PBR textures.
 
-    When low_vram_mode=True (recommended for T4 15GB):
+    When low_vram_mode=True (recommended for GPUs with limited VRAM):
       - Shape pipeline loaded with low_cpu_mem_usage=True to minimise system RAM
       - Texture (paint) pipeline is NOT loaded by default; enable explicitly
       - octree_resolution reduced to 256 (from 384) to cut peak VRAM
@@ -421,13 +421,25 @@ class Hunyuan3DGenerator:
         rgba[:, :, :3] = crop
         rgba[:, :, 3] = (crop_mask * 255).astype(np.uint8)
 
-        # Ensure minimum size
+        # Ensure minimum size — resize both the RGBA image AND the crop_mask
+        # so they always have the same dimensions.  The crop_offset (top-left
+        # corner in the original image) does NOT change, but downstream code
+        # must account for the scale factor when converting between crop and
+        # original image coordinates.
+        crop_scale = 1.0
         if min(h, w) < min_size:
-            scale = min_size / min(h, w)
-            new_h, new_w = int(h * scale), int(w * scale)
+            crop_scale = min_size / min(h, w)
+            new_h, new_w = int(h * crop_scale), int(w * crop_scale)
             rgba = np.array(
                 Image.fromarray(rgba).resize((new_w, new_h), Image.LANCZOS)
             )
+            # Resize crop_mask to match the resized image
+            crop_mask_uint8 = (crop_mask.astype(np.uint8) * 255)
+            crop_mask = np.array(
+                Image.fromarray(crop_mask_uint8).resize(
+                    (new_w, new_h), Image.NEAREST
+                )
+            ) > 127  # Convert back to boolean
 
         pil_image = Image.fromarray(rgba, mode="RGBA")
         return pil_image, crop_mask, crop_offset

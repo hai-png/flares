@@ -7,6 +7,7 @@ Provides functions for:
 - Pose refinement using correspondence points
 - Mesh rendering for MARCO refinement
 - Image cropping and keypoint sampling
+- Depth-based 3D point extraction
 """
 
 from __future__ import annotations
@@ -81,12 +82,66 @@ def transform_mesh(
     return transformed
 
 
+def _compute_alignment_2d_iou(
+    mesh: trimesh.Trimesh,
+    bbox_2d: np.ndarray,
+    camera_intrinsics: np.ndarray,
+) -> float:
+    """Compute 2D IoU between a mesh's projection and a 2D bounding box.
+
+    Projects the mesh's axis-aligned bounding box corners to 2D and
+    computes IoU with the detected 2D bbox.
+
+    Args:
+        mesh: Transformed mesh (already in camera space)
+        bbox_2d: (4,) xyxy detected 2D bbox
+        camera_intrinsics: (3,3) camera K matrix
+
+    Returns:
+        IoU value (0.0 if no overlap)
+    """
+    try:
+        bounds = mesh.bounds  # (2, 3) min, max
+        mins, maxs = bounds
+        corners = np.array([
+            [mins[0], mins[1], mins[2]],
+            [maxs[0], mins[1], mins[2]],
+            [maxs[0], maxs[1], mins[2]],
+            [mins[0], maxs[1], mins[2]],
+            [mins[0], mins[1], maxs[2]],
+            [maxs[0], mins[1], maxs[2]],
+            [maxs[0], maxs[1], maxs[2]],
+            [mins[0], maxs[1], maxs[2]],
+        ])
+        corners_2d = project_points_to_2d(corners, camera_intrinsics)
+        px1 = corners_2d[:, 0].min()
+        py1 = corners_2d[:, 1].min()
+        px2 = corners_2d[:, 0].max()
+        py2 = corners_2d[:, 1].max()
+
+        dx1, dy1, dx2, dy2 = bbox_2d.tolist()
+
+        ix1 = max(px1, dx1)
+        iy1 = max(py1, dy1)
+        ix2 = min(px2, dx2)
+        iy2 = min(py2, dy2)
+        inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+        area_proj = (px2 - px1) * (py2 - py1)
+        area_det = (dx2 - dx1) * (dy2 - dy1)
+        iou = inter / max(area_proj + area_det - inter, 1e-6)
+        return float(iou)
+    except Exception:
+        return 0.0
+
+
 def align_mesh_to_bbox(
     mesh: trimesh.Trimesh,
     bbox_center: np.ndarray,
     bbox_dims: np.ndarray,
     bbox_quat: np.ndarray,
     bbox_up_axis: str = "y",
+    camera_intrinsics: Optional[np.ndarray] = None,
+    bbox_2d: Optional[np.ndarray] = None,
 ) -> Tuple[trimesh.Trimesh, float, np.ndarray, np.ndarray]:
     """Align a canonically-posed mesh to a 3D bounding box.
 
@@ -95,104 +150,63 @@ def align_mesh_to_bbox(
 
     WildDet3D outputs bounding boxes in OpenCV camera coordinates (X-right,
     Y-down, Z-forward) with dimensions (W, L, H) where:
-      - W (width)  → Z-axis (forward/backward)
-      - L (length) → X-axis (left/right)
-      - H (height) → Y-axis (down/up, vertical)
+      - W (width)  maps to Z-axis in the bbox's local frame (forward/backward)
+      - L (length) maps to X-axis in the bbox's local frame (left/right)
+      - H (height) maps to Y-axis in the bbox's local frame (down/up)
 
-    This is NOT a simple (X, Y, Z) mapping!  The scale computation must
-    remap bbox dimensions to match the mesh's local axes before dividing.
+    Convention-based axis mapping (mesh → bbox local frame):
+      mesh X (width)  → bbox X (L)   — both are left/right
+      mesh Y (up)     → bbox -Y (H)  — up ↔ down flip via R_axis
+      mesh Z (depth)  → bbox Z (W)   — both are forward/backward
 
-    Steps:
-    1. Remap bbox dims: (W, L, H) → (L, H, W) to match (mesh_X, mesh_Y, mesh_Z)
-    2. Sort both mesh and bbox dimensions for best matching
-    3. Compute uniform scale factor from sorted ratios (median for robustness)
-    4. Build permutation matrix from sorted dimension correspondence
-    5. Convert quaternion to rotation matrix
-    6. Apply axis conversion (mesh Y-up → camera Y-down)
-    7. Center, scale, permute, rotate, and translate the mesh
+    The quaternion R_quat then rotates from the bbox local frame to camera
+    coordinates.  When camera intrinsics and the 2D detection box are
+    available, both X/Z orientations are tested and the one with higher
+    2D projection IoU is selected.
 
     Args:
         mesh: The canonical trimesh.Trimesh object
         bbox_center: (3,) 3D center of the bounding box in meters
         bbox_dims: (3,) (W, L, H) dimensions in meters from WildDet3D
         bbox_quat: (4,) (qw, qx, qy, qz) quaternion for rotation
-        bbox_up_axis: Up axis convention of the 3D bbox ("y" for WildDet3D/OpenCV)
+        bbox_up_axis: Up axis convention ("y" for WildDet3D/OpenCV)
+        camera_intrinsics: Optional (3,3) camera K matrix for 2D validation
+        bbox_2d: Optional (4,) xyxy 2D detection bbox for validation
 
     Returns:
         Tuple of (aligned_mesh, scale_factor, rotation_matrix, translation)
     """
     # Get mesh bounding box
-    mesh_bounds = mesh.bounds  # (2, 3) min and max
     mesh_extents = mesh.extents  # (3,) size along each axis in Y-up frame
     mesh_center = mesh.bounds.mean(axis=0)
+    mesh_extents_safe = np.maximum(mesh_extents, 1e-6)
 
     # ── Remap bbox dimensions to match mesh axes ──────────────────
     #
     # WildDet3D bbox_dims = (W, L, H) where:
-    #   W → camera Z (forward)  ↔  mesh Z (depth/front)
-    #   L → camera X (right)    ↔  mesh X (width)
-    #   H → camera Y (down)     ↔  mesh -Y (up)  [sign doesn't affect scale]
-    #
-    # So to compare with mesh_extents = (X, Y, Z):
-    #   mesh X ↔ L = bbox_dims[1]
-    #   mesh Y ↔ H = bbox_dims[2]
-    #   mesh Z ↔ W = bbox_dims[0]
+    #   W → bbox local Z ↔ mesh Z (depth)
+    #   L → bbox local X ↔ mesh X (width)
+    #   H → bbox local Y ↔ mesh Y (height, with sign flip for up/down)
     W, L, H = float(bbox_dims[0]), float(bbox_dims[1]), float(bbox_dims[2])
-    bbox_dims_remapped = np.array([L, H, W], dtype=np.float64)
+    # Direct correspondence: bbox local (X, Y, Z) = (L, H, W)
+    # This maps directly to mesh (X, Y, Z) in the canonical Y-up frame
+    bbox_dims_mapped = np.array([L, H, W], dtype=np.float64)
 
-    # ── Sorted dimension matching ─────────────────────────────────
-    #
-    # The mesh from Hunyuan3D may have a different axis assignment
-    # than the bbox's local axes.  For example, the mesh's Y axis
-    # (up) might be the largest dimension while the bbox's L (X)
-    # is the largest.  By sorting both sets of dimensions in
-    # descending order and matching them, we find the best
-    # permutation of mesh axes to align with the bbox's local axes.
-    mesh_extents_safe = np.maximum(mesh_extents, 1e-6)
-    mesh_sorted_idx = np.argsort(mesh_extents_safe)[::-1]   # indices that sort descending
-    bbox_sorted_idx = np.argsort(bbox_dims_remapped)[::-1]
-
-    mesh_sorted = mesh_extents_safe[mesh_sorted_idx]
-    bbox_sorted = bbox_dims_remapped[bbox_sorted_idx]
-
-    # Compute uniform scale from sorted pairs.
-    # Use median instead of min — min makes objects too small when
-    # the mesh and bbox shapes don't match well.  Median gives a
-    # balanced scale that keeps at least 2 of 3 dimensions close.
-    scale_ratios_sorted = bbox_sorted / mesh_sorted
-    scale_factor = float(np.median(scale_ratios_sorted))
-
-    # ── Build permutation matrix ──────────────────────────────────
-    #
-    # R_perm maps mesh axis mesh_sorted_idx[i] to bbox axis
-    # bbox_sorted_idx[i] so that the i-th largest mesh dimension
-    # aligns with the i-th largest bbox dimension.
-    R_perm = np.zeros((3, 3), dtype=np.float64)
-    for i in range(3):
-        R_perm[bbox_sorted_idx[i], mesh_sorted_idx[i]] = 1.0
-
-    # Ensure R_perm is a proper rotation (det = +1).
-    # Permutation matrices that swap an odd number of axes have det=-1.
-    # Negate the row corresponding to the smallest dimension so that
-    # the visual error from the sign flip is least noticeable.
-    if np.linalg.det(R_perm) < 0:
-        smallest_bbox_idx = bbox_sorted_idx[-1]
-        R_perm[smallest_bbox_idx] *= -1.0
+    # ── Scale computation ─────────────────────────────────────────
+    # Per-axis scale ratios: how much to scale each mesh axis to fit bbox
+    scale_ratios = bbox_dims_mapped / mesh_extents_safe
+    # Use median for robustness — avoids both under-scaling (min) and
+    # over-scaling (max) when mesh and bbox shapes don't match perfectly
+    scale_factor = float(np.median(scale_ratios))
 
     # ── Rotation from quaternion ──────────────────────────────────
     R_quat = quaternion_to_rotation_matrix(bbox_quat)
 
     # ── Axis convention conversion ────────────────────────────────
-    # WildDet3D uses OpenCV (Y-down, Z-forward).
-    # Hunyuan3D generates meshes in Y-up convention.
-    # The conversion: (x, y, z)_mesh → (x, -y, -z)_camera
-    # This is diag(1, -1, -1)
-    #
-    # The full rotation is: R = R_quat @ R_axis @ R_perm
-    # where:
-    #   R_perm  reorders mesh axes to match bbox local axes
-    #   R_axis  converts from Y-up to Y-down (camera convention)
-    #   R_quat  rotates from bbox local frame to camera frame
+    # Hunyuan3D mesh: X-right, Y-up, Z-toward-viewer
+    # OpenCV camera:  X-right, Y-down, Z-forward
+    # Conversion: (x, y, z)_mesh → (x, -y, -z)_camera
+    # diag(1, -1, -1) is a proper rotation (det = +1) that flips Y and Z
     if bbox_up_axis == "y":
         R_axis = np.array([
             [1,  0,  0],
@@ -202,18 +216,95 @@ def align_mesh_to_bbox(
     else:
         R_axis = np.eye(3, dtype=np.float64)
 
+    # ── Determine the best axis mapping ───────────────────────────
+    # Convention: mesh (X, Y, Z) → bbox local (X, Y, Z) directly
+    # But for X and Z, there are 2 possible orderings (swap or no swap).
+    # When camera intrinsics are available, we test both and pick the
+    # one whose 2D projection best matches the detected 2D bbox.
+
+    # Option 1: identity — mesh X→bbox X, mesh Z→bbox Z
+    R_perm_identity = np.eye(3, dtype=np.float64)
+
+    # Option 2: swap X and Z — mesh X→bbox Z, mesh Z→bbox X
+    # This is a 90° rotation around Y axis
+    R_perm_swap = np.array([
+        [0, 0, 1],
+        [0, 1, 0],
+        [1, 0, 0],
+    ], dtype=np.float64)
+    # det = -1, so negate smallest-dimension row to make it proper
+    # The smallest bbox dimension is typically the depth, which maps to
+    # the swapped axis. Negate the row with the smallest bbox dimension.
+    # For swap, the X row becomes [0,0,1] (maps from mesh Z) and Z row
+    # becomes [1,0,0] (maps from mesh X). Negate the one mapping to the
+    # smallest bbox dimension.
+    if W < L:
+        # Z axis (W) is smaller than X axis (L), negate Z row
+        R_perm_swap[2] *= -1
+    else:
+        R_perm_swap[0] *= -1
+
+    # Recompute scale for the swap option
+    scale_ratios_swap = np.array([
+        bbox_dims_mapped[2] / mesh_extents_safe[0],  # mesh X → bbox Z (W)
+        bbox_dims_mapped[1] / mesh_extents_safe[1],  # mesh Y → bbox Y (H)
+        bbox_dims_mapped[0] / mesh_extents_safe[2],  # mesh Z → bbox X (L)
+    ])
+    scale_factor_swap = float(np.median(scale_ratios_swap))
+
+    # Decide which option to use
+    use_swap = False
+
+    if camera_intrinsics is not None and bbox_2d is not None:
+        # Test both options by computing 2D projection IoU
+        best_iou = -1.0
+
+        for perm, sf in [(R_perm_identity, scale_factor),
+                         (R_perm_swap, scale_factor_swap)]:
+            R = R_quat @ R_axis @ perm
+            test_mesh = mesh.copy()
+            test_mesh.apply_translation(-mesh_center)
+            test_mesh.apply_scale(sf)
+            T_rot = np.eye(4)
+            T_rot[:3, :3] = R
+            test_mesh.apply_transform(T_rot)
+            test_mesh.apply_translation(bbox_center)
+            iou = _compute_alignment_2d_iou(test_mesh, bbox_2d, camera_intrinsics)
+            if iou > best_iou:
+                best_iou = iou
+                use_swap = (perm is R_perm_swap)
+
+        logger.info(
+            f"  2D validation: identity_IoU vs swap_IoU, "
+            f"chose {'swap' if use_swap else 'identity'}, "
+            f"best_IoU={best_iou:.3f}"
+        )
+    else:
+        # Without 2D validation, use convention-based heuristic:
+        # If the direct scale ratios are more balanced, use identity.
+        # If the swap ratios are more balanced, use swap.
+        # "More balanced" = lower coefficient of variation (std/mean).
+        cv_direct = np.std(scale_ratios) / max(np.mean(scale_ratios), 1e-6)
+        cv_swap = np.std(scale_ratios_swap) / max(np.mean(scale_ratios_swap), 1e-6)
+        use_swap = cv_swap < cv_direct
+
+    if use_swap:
+        R_perm = R_perm_swap
+        scale_factor = scale_factor_swap
+        scale_ratios = scale_ratios_swap
+    else:
+        R_perm = R_perm_identity
+
     R = R_quat @ R_axis @ R_perm
 
-    # Log detailed alignment info for debugging
-    scale_ratios_direct = bbox_dims_remapped / mesh_extents_safe
+    # Log detailed alignment info
     logger.info(
         f"  Scale computation: mesh_extents={mesh_extents}, "
         f"bbox_dims=(W={W:.3f}, L={L:.3f}, H={H:.3f}), "
-        f"remapped=(L={L:.3f}, H={H:.3f}, W={W:.3f}), "
-        f"direct_ratios={scale_ratios_direct}, "
-        f"sorted_ratios={scale_ratios_sorted}, "
+        f"mapped=(L={L:.3f}, H={H:.3f}, W={W:.3f}), "
+        f"scale_ratios={scale_ratios}, "
         f"scale={scale_factor:.4f}, "
-        f"perm_axes(mesh→bbox)={list(zip(mesh_sorted_idx, bbox_sorted_idx))}"
+        f"axis_swap={use_swap}"
     )
 
     # ── Build the full transformation ─────────────────────────────
@@ -222,19 +313,14 @@ def align_mesh_to_bbox(
     # 3. Rotate it (includes permutation + axis conversion + quaternion)
     # 4. Translate to bbox center
 
-    # Center the mesh at origin first
     centered_mesh = mesh.copy()
     centered_mesh.apply_translation(-mesh_center)
-
-    # Apply scale
     centered_mesh.apply_scale(scale_factor)
 
-    # Apply rotation
     T_rot = np.eye(4)
     T_rot[:3, :3] = R
     centered_mesh.apply_transform(T_rot)
 
-    # Apply translation to bbox center
     centered_mesh.apply_translation(bbox_center)
 
     return centered_mesh, scale_factor, R, bbox_center
@@ -356,52 +442,38 @@ def draw_bbox3d_on_image(
 # ─── Pose Refinement with Correspondences ────────────────────────
 
 def refine_pose_with_correspondences(
+    object_points_3d: np.ndarray,
+    image_points_2d: np.ndarray,
+    camera_intrinsics: np.ndarray,
     current_rotation: np.ndarray,
     current_translation: np.ndarray,
-    src_points_2d: np.ndarray,
-    tgt_points_2d: np.ndarray,
-    src_points_3d: np.ndarray,
-    camera_intrinsics: np.ndarray,
-    scale_factor: float,
-    mesh: trimesh.Trimesh,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Refine 6-DoF object pose using 2D-3D correspondences from MARCO.
+    """Refine 6-DoF object pose using 2D-3D correspondences.
 
-    Uses PnP (Perspective-n-Point) to refine the pose given semantic
-    correspondence points between the cropped object image and rendered mesh.
+    Uses PnP (Perspective-n-Point) to find the pose that best explains
+    the observed 2D image points given the corresponding 3D object points.
 
     Args:
-        current_rotation: (3,3) current rotation matrix
-        current_translation: (3,) current translation vector
-        src_points_2d: (N,2) source 2D points (from cropped object image)
-        tgt_points_2d: (N,2) target 2D points (from rendered mesh image)
-        src_points_3d: (N,3) corresponding 3D points on the mesh
-        camera_intrinsics: (3,3) camera intrinsic matrix
-        scale_factor: Scale factor applied to the mesh
-        mesh: The mesh object
+        object_points_3d: (N,3) 3D points in the object's local coordinate
+                          frame (already scaled by scale_factor)
+        image_points_2d: (N,2) 2D observed points in the camera image
+                         (in the coordinate system matching camera_intrinsics)
+        camera_intrinsics: (3,3) camera intrinsic matrix matching the
+                           coordinate system of image_points_2d
+        current_rotation: (3,3) current rotation matrix (fallback if PnP fails)
+        current_translation: (3,) current translation vector (fallback)
 
     Returns:
         Tuple of (refined_rotation, refined_translation)
     """
-    if len(src_points_2d) < 4:
-        # Not enough correspondences for PnP; return current pose
+    if len(object_points_3d) < 4:
         return current_rotation, current_translation
 
-    # Scale 3D points by the same scale factor used in alignment.
-    # These points are in the object's local coordinate frame (centered at origin).
-    src_points_3d_scaled = src_points_3d * scale_factor
-
-    # solvePnP expects 3D points in the OBJECT's local coordinate frame and
-    # 2D points in the image. It returns (rvec, tvec) such that:
-    #   p_camera = R @ p_object + t
-    # Previously the code mistakenly transformed 3D points to world/camera
-    # frame before passing them, which makes solvePnP solve for an identity
-    # transform — rendering the refinement useless.
     dist_coeffs = np.zeros((4, 1))  # No distortion
 
     success, rvec, tvec = cv2.solvePnP(
-        src_points_3d_scaled.astype(np.float64),
-        tgt_points_2d.astype(np.float64),
+        object_points_3d.astype(np.float64),
+        image_points_2d.astype(np.float64),
         camera_intrinsics.astype(np.float64),
         dist_coeffs,
         flags=cv2.SOLVEPNP_ITERATIVE,
@@ -473,7 +545,7 @@ def render_mesh(
     camera_pose: np.ndarray = None,
     original_image_shape: Optional[Tuple[int, int]] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Render a mesh to an RGB image and extract 2D keypoints.
+    """Render a mesh to an RGB image and depth map.
 
     Uses pyrender or trimesh's offscreen rendering.
 
@@ -519,10 +591,6 @@ def render_mesh(
             fy *= scale_y
             cx *= scale_x
             cy *= scale_y
-        else:
-            # Without original dimensions, assume intrinsics are already
-            # for the render resolution (backward compatibility)
-            pass
     else:
         # Default: fit camera to see the whole mesh
         fx = fy = resolution
@@ -530,12 +598,7 @@ def render_mesh(
 
     camera = pyrender.IntrinsicsCamera(fx=fx, fy=fy, cx=cx, cy=cy, znear=0.01, zfar=100.0)
 
-    # OpenCV convention: Y-down, Z-forward
-    # OpenGL convention: Y-up, Z-backward (camera looks along -Z)
-    # We apply the conversion matrix so the mesh (in OpenCV coords) is
-    # rendered correctly by the OpenGL camera.
-    #   OpenGL_pose = OpenCV_pose @ flip_matrix
-    # where flip_matrix flips Y and Z axes.
+    # OpenCV → OpenGL conversion
     cv2gl = np.array([
         [1,  0,  0, 0],
         [0, -1,  0, 0],
@@ -546,11 +609,9 @@ def render_mesh(
     if camera_pose is not None:
         gl_camera_pose = camera_pose @ cv2gl
     else:
-        # Camera at origin in OpenCV convention → in OpenGL, the camera
-        # needs to be placed so it looks along -Z at the scene.
         gl_camera_pose = cv2gl
 
-    camera_node = scene.add(camera, pose=gl_camera_pose)
+    scene.add(camera, pose=gl_camera_pose)
 
     # Add lighting (in the same frame as the camera)
     light = pyrender.DirectionalLight(color=[1.0, 1.0, 1.0], intensity=3.0)
@@ -575,7 +636,6 @@ def _render_mesh_trimesh(
 
     # Try to render using trimesh
     try:
-        # trimesh uses pyglet/PIL for offscreen rendering
         png = scene.save_image(resolution=[resolution, resolution])
         if png is not None:
             import io
@@ -586,7 +646,6 @@ def _render_mesh_trimesh(
         pass
 
     # Final fallback: create a simple depth-based silhouette
-    # Project mesh vertices to image
     vertices = mesh.vertices
     if camera_pose is not None:
         R = camera_pose[:3, :3]
@@ -602,7 +661,6 @@ def _render_mesh_trimesh(
         fx = fy = resolution / 2.0
         cx = cy = resolution / 2.0
 
-    # Simple projection
     img = np.ones((resolution, resolution, 3), dtype=np.uint8) * 255
     depth = np.zeros((resolution, resolution), dtype=np.float32)
 
@@ -623,7 +681,7 @@ def render_mesh_for_marco(
     camera_intrinsics: np.ndarray,
     resolution: int = 512,
     original_image_shape: Optional[Tuple[int, int]] = None,
-) -> np.ndarray:
+) -> Tuple[np.ndarray, np.ndarray]:
     """Render a mesh with its transform for MARCO comparison.
 
     Renders the mesh from the same viewpoint as the original camera,
@@ -637,24 +695,86 @@ def render_mesh_for_marco(
         original_image_shape: (H, W) of the original image, for intrinsics scaling
 
     Returns:
-        Rendered RGB image (H, W, 3)
+        Tuple of (rendered RGB image (H, W, 3), depth_map (H, W))
     """
     # Apply transform to mesh
     rendered_mesh = mesh.copy()
     rendered_mesh.apply_transform(transform)
 
-    # Set camera pose (looking at the object from front)
-    # In camera coordinate system, camera is at origin looking along +Z
+    # Camera at origin in OpenCV convention
     camera_pose = np.eye(4)
 
-    rgb, _ = render_mesh(
+    rgb, depth = render_mesh(
         rendered_mesh,
         resolution=resolution,
         camera_intrinsics=camera_intrinsics,
         camera_pose=camera_pose,
         original_image_shape=original_image_shape,
     )
-    return rgb
+    return rgb, depth
+
+
+def unproject_depth_to_3d(
+    keypoints_2d: np.ndarray,
+    depth_map: np.ndarray,
+    camera_intrinsics: np.ndarray,
+) -> np.ndarray:
+    """Unproject 2D keypoints with depth values to 3D camera-space points.
+
+    For each 2D keypoint, looks up the depth value and unprojects to
+    get the 3D position in camera coordinates.
+
+    Args:
+        keypoints_2d: (N, 2) 2D pixel coordinates (u, v) in the depth map
+        depth_map: (H, W) depth map from rendering (depth values in camera space)
+        camera_intrinsics: (3,3) camera K matrix matching the depth map resolution
+
+    Returns:
+        (N, 3) 3D points in camera coordinates
+    """
+    fx = camera_intrinsics[0, 0]
+    fy = camera_intrinsics[1, 1]
+    cx = camera_intrinsics[0, 2]
+    cy = camera_intrinsics[1, 2]
+
+    h, w = depth_map.shape
+    points_3d = []
+
+    for kp in keypoints_2d:
+        u, v = int(round(kp[0])), int(round(kp[1]))
+
+        # Clamp to valid range
+        u = max(0, min(u, w - 1))
+        v = max(0, min(v, h - 1))
+
+        z = float(depth_map[v, u])
+
+        if z <= 0 or not np.isfinite(z):
+            # Invalid depth — try a small neighborhood
+            found = False
+            for du in range(-2, 3):
+                for dv in range(-2, 3):
+                    nu, nv = u + du, v + dv
+                    if 0 <= nu < w and 0 <= nv < h:
+                        nz = float(depth_map[nv, nu])
+                        if nz > 0 and np.isfinite(nz):
+                            z = nz
+                            u, v = nu, nv
+                            found = True
+                            break
+                if found:
+                    break
+
+        if z <= 0 or not np.isfinite(z):
+            points_3d.append(np.array([0.0, 0.0, 0.0]))
+            continue
+
+        # Unproject: X = Z * (u - cx) / fx, Y = Z * (v - cy) / fy
+        x = z * (u - cx) / fx
+        y = z * (v - cy) / fy
+        points_3d.append(np.array([x, y, z]))
+
+    return np.array(points_3d, dtype=np.float64)
 
 
 # ─── Image Operations ────────────────────────────────────────────
@@ -722,7 +842,6 @@ def sample_keypoints_from_mask(
         return np.zeros((0, 2), dtype=np.float32)
 
     if method == "uniform":
-        # Sample keypoints on a uniform grid within the mask
         x_min, x_max = xs.min(), xs.max()
         y_min, y_max = ys.min(), ys.max()
 
@@ -746,14 +865,12 @@ def sample_keypoints_from_mask(
         return points
 
     elif method == "contour":
-        # Sample keypoints along the contour of the mask
         mask_uint8 = mask.astype(np.uint8) * 255
         contours, _ = cv2.findContours(mask_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
         if not contours:
             return np.zeros((0, 2), dtype=np.float32)
 
-        # Use the largest contour
         contour = max(contours, key=cv2.contourArea)
         contour_pts = contour.squeeze(1)  # (N, 2) xy
 
@@ -779,6 +896,8 @@ def _ray_mesh_intersect_moller_trumbore(
 
     Pure-numpy fallback that does NOT require rtree or pyembree.
     Tests the ray against every triangle and returns the closest hit.
+    Uses explicit numpy operations (no einsum) for maximum compatibility
+    across numpy versions and platforms.
 
     Args:
         ray_origin: (3,) ray origin
@@ -790,6 +909,13 @@ def _ray_mesh_intersect_moller_trumbore(
     Returns:
         (3,) intersection point or None if no hit
     """
+    # Ensure correct dtypes for robust indexing
+    vertices = np.asarray(vertices, dtype=np.float64)
+    faces = np.asarray(faces, dtype=np.int64)
+
+    if len(faces) == 0:
+        return None
+
     # Get triangle vertices for all faces at once
     v0 = vertices[faces[:, 0]]  # (F, 3)
     v1 = vertices[faces[:, 1]]  # (F, 3)
@@ -798,38 +924,27 @@ def _ray_mesh_intersect_moller_trumbore(
     edge1 = v1 - v0  # (F, 3)
     edge2 = v2 - v0  # (F, 3)
 
-    # h = cross(ray_dir, edge2)
     h = np.cross(ray_dir, edge2)  # (F, 3)
-    a = np.einsum('ij,ij->i', edge1, h)  # dot product per row: (F,)
+    a = (edge1 * h).sum(axis=1)  # (F,)
 
     # Check if ray is parallel to triangle
     valid = np.abs(a) > eps
 
-    f = np.zeros(len(a))
+    f = np.zeros(len(a), dtype=np.float64)
     f[valid] = 1.0 / a[valid]
 
-    # s = ray_origin - v0
     s = ray_origin - v0  # (F, 3)
+    u = f * (s * h).sum(axis=1)  # (F,)
 
-    # u = f * dot(s, h)
-    u = f * np.einsum('ij,ij->i', s, h)
-
-    # Check u bounds
     valid &= (u >= 0.0) & (u <= 1.0)
 
-    # q = cross(s, edge1)
     q = np.cross(s, edge1)  # (F, 3)
+    v = f * (q * ray_dir).sum(axis=1)  # (F,)
 
-    # v = f * dot(ray_dir, q)
-    v = f * np.einsum('j,ij->i', ray_dir, q)
-
-    # Check v bounds
     valid &= (v >= 0.0) & (u + v <= 1.0)
 
-    # t = f * dot(edge2, q)
-    t = f * np.einsum('ij,ij->i', edge2, q)
+    t = f * (edge2 * q).sum(axis=1)  # (F,)
 
-    # Check t > eps (intersection in front of ray)
     valid &= (t > eps)
 
     if not np.any(valid):
@@ -851,52 +966,60 @@ def get_mesh_3d_points_for_2d_keypoints(
 ) -> np.ndarray:
     """Get 3D points on the mesh surface corresponding to 2D keypoints.
 
-    Projects rays from 2D keypoints and finds intersections with the mesh.
-    First tries trimesh's built-in ray intersection (which uses rtree/pyembree
-    if available for speed). If that fails (e.g. rtree not installed), falls
-    back to a pure-numpy Möller–Trumbore implementation.
+    Projects rays from the camera through 2D keypoints and finds
+    intersections with the mesh surface. The mesh MUST be in camera
+    coordinates for the ray casting to produce meaningful results.
+
+    If mesh_transform is provided, the mesh is first transformed to
+    camera space before ray casting. The returned 3D points are in
+    camera space.
 
     Args:
-        mesh: The trimesh object
-        keypoints_2d: (N, 2) 2D keypoint coordinates (x, y)
-        camera_intrinsics: (3,3) camera K matrix
-        mesh_transform: (4,4) optional transform applied to the mesh
+        mesh: The trimesh object (canonical or already in camera space)
+        keypoints_2d: (N, 2) 2D keypoint coordinates (u, v) in pixels
+        camera_intrinsics: (3,3) camera K matrix matching the keypoint coordinates
+        mesh_transform: (4,4) optional transform to apply to the mesh
+                        (e.g., current pose to bring it to camera space)
 
     Returns:
-        (N, 3) 3D points on the mesh surface
+        (N, 3) 3D points on the mesh surface (in camera space if
+        mesh_transform was applied, otherwise in mesh local space)
     """
     if mesh_transform is not None:
         mesh = mesh.copy()
         mesh.apply_transform(mesh_transform)
+
+    # Ensure mesh has valid geometry for ray casting
+    if len(mesh.faces) == 0 or len(mesh.vertices) == 0:
+        logger.warning("Mesh has no faces/vertices; returning zero 3D points")
+        return np.zeros((len(keypoints_2d), 3), dtype=np.float32)
 
     fx = camera_intrinsics[0, 0]
     fy = camera_intrinsics[1, 1]
     cx = camera_intrinsics[0, 2]
     cy = camera_intrinsics[1, 2]
 
-    # Try trimesh's ray intersection first (fast with rtree/pyembree)
-    use_trimesh_ray = True
+    # Determine which ray intersection method to use
+    use_trimesh_ray = False
     try:
         import rtree  # noqa: F401
+        use_trimesh_ray = True
     except ImportError:
-        use_trimesh_ray = False
-
+        pass
     if not use_trimesh_ray:
-        # Check if pyembree is available as an alternative accelerator
         try:
             import embree  # noqa: F401
             use_trimesh_ray = True
         except ImportError:
-            logger.info(
-                "rtree/embree not installed — using pure-numpy Möller–Trumbore "
-                "ray-triangle intersection (slower but no extra dependencies). "
-                "Install rtree for faster ray queries: pip install rtree"
+            logger.debug(
+                "rtree/embree not installed — using Möller–Trumbore "
+                "ray-triangle intersection"
             )
 
     points_3d = []
     for kp in keypoints_2d:
-        u, v = kp[0], kp[1]
-        # Create ray from pixel
+        u, v = float(kp[0]), float(kp[1])
+        # Create ray from pixel through camera origin
         ray_dir = np.array([(u - cx) / fx, (v - cy) / fy, 1.0])
         ray_dir = ray_dir / np.linalg.norm(ray_dir)
         ray_origin = np.array([0.0, 0.0, 0.0])
@@ -910,23 +1033,26 @@ def get_mesh_3d_points_for_2d_keypoints(
                     ray_directions=[ray_dir],
                 )
                 if len(locations) > 0:
-                    distances = np.linalg.norm(locations, axis=1)
-                    closest_idx = np.argmin(distances)
+                    # Pick the closest intersection (smallest t along the ray)
+                    t_values = (locations - ray_origin) @ ray_dir
+                    closest_idx = np.argmin(t_values)
                     points_3d.append(locations[closest_idx])
                     found = True
             except Exception:
-                # Fall through to Möller–Trumbore
                 pass
 
         if not found:
             # Pure-numpy fallback: Möller–Trumbore ray-triangle intersection
-            hit = _ray_mesh_intersect_moller_trumbore(
-                ray_origin, ray_dir,
-                mesh.vertices, mesh.faces,
-            )
-            if hit is not None:
-                points_3d.append(hit)
-            else:
-                points_3d.append(np.array([0.0, 0.0, 0.0]))  # fallback
+            try:
+                hit = _ray_mesh_intersect_moller_trumbore(
+                    ray_origin, ray_dir,
+                    mesh.vertices, mesh.faces,
+                )
+                if hit is not None:
+                    points_3d.append(hit)
+                else:
+                    points_3d.append(np.array([0.0, 0.0, 0.0]))
+            except Exception:
+                points_3d.append(np.array([0.0, 0.0, 0.0]))
 
     return np.array(points_3d, dtype=np.float32)

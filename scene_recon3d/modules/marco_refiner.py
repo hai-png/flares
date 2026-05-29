@@ -27,6 +27,7 @@ from ..utils.geometry import (
     render_mesh_for_marco,
     sample_keypoints_from_mask,
     get_mesh_3d_points_for_2d_keypoints,
+    unproject_depth_to_3d,
 )
 
 logger = logging.getLogger(__name__)
@@ -38,6 +39,14 @@ class MARCORefiner:
     Given a cropped object image and a rendered image of its 3D model,
     uses MARCO to find semantic correspondences between them, then
     uses these correspondences to refine the 6-DoF pose.
+
+    The refinement flow for each object:
+    1. Sample 2D keypoints from the object's crop mask
+    2. Render the aligned 3D mesh from the camera viewpoint
+    3. Use MARCO to find where crop keypoints appear in the render
+    4. Use the depth buffer to get 3D mesh points for the target keypoints
+    5. Convert 3D points from camera space to object frame
+    6. Use solvePnP with 3D object points + 2D source observations to refine pose
 
     Example:
         >>> refiner = MARCORefiner()
@@ -81,8 +90,6 @@ class MARCORefiner:
         Uses torch.hub for auto-download by default, or loads from
         a local checkpoint file.
         """
-        # Add MARCO repo to path if needed
-        # Module is at flares/scene_recon3d/modules/ → 2 levels up to flares/
         repo_path = os.path.join(
             os.path.dirname(__file__), "..", "..", "repos", "MARCO"
         )
@@ -141,7 +148,7 @@ class MARCORefiner:
             source_image: (H, W, 3) uint8 source image (cropped object)
             target_image: (H, W, 3) uint8 target image (rendered mesh)
             source_keypoints: (N, 2) source keypoint coordinates (x, y)
-                              in original image pixel space
+                              in source image pixel space
 
         Returns:
             Tuple of (source_keypoints, predicted_target_keypoints)
@@ -150,7 +157,6 @@ class MARCORefiner:
         if self.model is None:
             self.load_model()
 
-        # Save images temporarily for MARCO's preprocess_data
         import tempfile
         from PIL import Image as PILImage
 
@@ -162,31 +168,23 @@ class MARCORefiner:
             PILImage.fromarray(target_image).save(tgt_path)
 
         try:
-            # Convert keypoints to list format for MARCO
             src_kps_list = source_keypoints.tolist()
 
-            # Prepare input using MARCO's preprocessing
             inputs = self.model.preprocess_data(
                 src_path, tgt_path, src_kps_list, device=self.device
             )
 
-            # Predict target keypoint positions
             with torch.no_grad():
                 pred_kps = self.model(**inputs)
 
-            # pred_kps is in resized+padded space; convert back to original
             pred_kps_np = pred_kps.cpu().numpy()[0]  # (N, 2)
 
-            # We need to convert from MARCO's resized+padded space back to
-            # original target image space.
-            # MARCO's preprocess_data pads images to square with the longest side
-            # at inference_res. We need to reverse this transform.
+            # Convert from MARCO's resized+padded space back to original
             tgt_h, tgt_w = target_image.shape[:2]
             scale = self.inference_res / max(tgt_h, tgt_w)
             pad_w = self.inference_res - int(tgt_w * scale)
             pad_h = self.inference_res - int(tgt_h * scale)
 
-            # Convert from padded space to original space
             pred_original = np.zeros_like(pred_kps_np)
             pred_original[:, 0] = (pred_kps_np[:, 0] - pad_w / 2) / scale
             pred_original[:, 1] = (pred_kps_np[:, 1] - pad_h / 2) / scale
@@ -208,15 +206,19 @@ class MARCORefiner:
 
         Steps:
         1. Sample keypoints on the cropped object image (source)
-        2. Render the aligned 3D model from the same viewpoint (target)
+        2. Render the aligned 3D model from the camera viewpoint (target)
         3. Use MARCO to find where source keypoints appear in the render
-        4. Use 2D-3D correspondences to refine the pose via PnP
+        4. Get 3D mesh points corresponding to the target keypoints
+           (using depth buffer or ray casting)
+        5. Convert 3D points from camera space to object frame
+        6. Use solvePnP with 3D object points and 2D source observations
+           to refine the pose
 
         Args:
             obj: DetectedObject with aligned mesh and initial pose
             camera_intrinsics: (3,3) camera intrinsic matrix (for the full image)
             render_resolution: Resolution for rendering the mesh
-            original_image_shape: (H, W) of the original image, for intrinsics scaling
+            original_image_shape: (H, W) of the original image
 
         Returns:
             Updated DetectedObject with refined pose
@@ -261,10 +263,6 @@ class MARCORefiner:
             )
 
             # 2. Render the mesh with current pose
-            # CRITICAL: the transform must include scale so that the
-            # rendered mesh matches the object's actual size in the scene.
-            # Without scale, MARCO compares a canonical-size render against
-            # the cropped object image, producing wrong correspondences.
             T_scale = np.eye(4)
             T_scale[0, 0] = T_scale[1, 1] = T_scale[2, 2] = scale_factor
             T_rot = np.eye(4)
@@ -274,7 +272,7 @@ class MARCORefiner:
             current_transform = T_trans @ T_rot @ T_scale
 
             try:
-                rendered_image = render_mesh_for_marco(
+                rendered_image, depth_map = render_mesh_for_marco(
                     obj.mesh,
                     current_transform,
                     camera_intrinsics,
@@ -291,15 +289,12 @@ class MARCORefiner:
             )
 
             # Scale source keypoints to render resolution
-            if obj.crop_image is not None:
-                h_ratio = render_resolution / obj.crop_image.shape[0]
-                w_ratio = render_resolution / obj.crop_image.shape[1]
-                src_kps_scaled = src_keypoints.copy()
-                src_kps_scaled[:, 0] *= w_ratio
-                src_kps_scaled[:, 1] *= h_ratio
-            else:
-                src_kps_scaled = src_keypoints
-                h_ratio = w_ratio = 1.0
+            crop_h, crop_w = obj.crop_image.shape[:2]
+            h_ratio = render_resolution / crop_h
+            w_ratio = render_resolution / crop_w
+            src_kps_scaled = src_keypoints.copy()
+            src_kps_scaled[:, 0] *= w_ratio
+            src_kps_scaled[:, 1] *= h_ratio
 
             # 3. Find correspondences using MARCO
             try:
@@ -331,65 +326,107 @@ class MARCORefiner:
             obj.correspondence_points_src = src_kps_valid
             obj.correspondence_points_tgt = tgt_kps_valid
 
-            # 4. Get 3D points on the mesh for these keypoints
-            # Map source keypoints back to crop-image coordinates
-            src_kps_original = src_kps_valid.copy()
-            if obj.crop_image is not None:
-                src_kps_original[:, 0] /= w_ratio
-                src_kps_original[:, 1] /= h_ratio
+            # 4. Get 3D points on the mesh corresponding to target keypoints
+            #
+            # The target keypoints are where MARCO says the source features
+            # appear in the rendered image. We need to find the 3D mesh points
+            # at those 2D locations.
+            #
+            # Approach: Use the depth buffer from rendering to unproject
+            # the 2D target keypoints to 3D camera-space points.
+            #
+            # Build the scaled camera intrinsics for the render resolution
+            K_scaled = camera_intrinsics.copy().astype(np.float64)
+            if original_image_shape is not None:
+                orig_h, orig_w = original_image_shape
+                K_scaled[0, 0] *= render_resolution / orig_w
+                K_scaled[0, 2] *= render_resolution / orig_w
+                K_scaled[1, 1] *= render_resolution / orig_h
+                K_scaled[1, 2] *= render_resolution / orig_h
 
             try:
-                # Get 3D points on the canonical mesh.
-                # CRITICAL: keypoints are in crop-image pixel coordinates,
-                # but camera_intrinsics are for the full image. We must
-                # adjust the principal point (cx, cy) by the crop offset
-                # so that rays are cast correctly from the crop region.
-                K_crop = camera_intrinsics.copy()
-                if obj.crop_offset is not None:
-                    K_crop[0, 2] -= obj.crop_offset[0]  # cx -= x_offset
-                    K_crop[1, 2] -= obj.crop_offset[1]  # cy -= y_offset
-                else:
-                    # Fallback: estimate offset from bbox (less accurate)
-                    x1, y1 = obj.bbox_2d[:2].astype(int)
-                    K_crop[0, 2] -= x1
-                    K_crop[1, 2] -= y1
+                # Use depth buffer to get 3D points in camera space
+                has_valid_depth = depth_map is not None and np.any(depth_map > 0)
 
-                points_3d = get_mesh_3d_points_for_2d_keypoints(
-                    obj.mesh,
-                    src_kps_original,
-                    K_crop,
-                    mesh_transform=None,  # canonical mesh (centered at origin)
-                )
+                if has_valid_depth:
+                    points_3d_cam = unproject_depth_to_3d(
+                        tgt_kps_valid, depth_map, K_scaled,
+                    )
+                else:
+                    # Fall back to ray casting against the mesh in camera space
+                    logger.info(
+                        f"Object {obj.object_id}: depth buffer empty, "
+                        "falling back to ray casting"
+                    )
+                    points_3d_cam = get_mesh_3d_points_for_2d_keypoints(
+                        obj.mesh,
+                        tgt_kps_valid,
+                        K_scaled,
+                        mesh_transform=current_transform,
+                    )
+
+                # Filter out zero-valued points (failed extractions)
+                valid_3d = np.any(points_3d_cam != 0, axis=1)
+                if valid_3d.sum() < 4:
+                    logger.warning(
+                        f"Object {obj.object_id}: too few valid 3D points "
+                        f"({valid_3d.sum()}); skipping this iteration"
+                    )
+                    break
+
+                # Keep only valid points
+                tgt_kps_valid = tgt_kps_valid[valid_3d]
+                src_kps_valid = src_kps_valid[valid_3d]
+                points_3d_cam = points_3d_cam[valid_3d]
+
             except Exception as e:
                 logger.warning(
                     f"3D point extraction failed for object {obj.object_id}: {e}"
                 )
                 break
 
-            # 5. Refine pose using PnP with correspondences
-            # CRITICAL: tgt_points_2d are in render_resolution pixel
-            # coordinates, so we must scale the camera intrinsics from
-            # the original image resolution to render_resolution before
-            # passing them to solvePnP.  Without this scaling, solvePnP
-            # interprets the points as if they were in the original image
-            # and computes a wrong focal length → wrong pose.
-            K_scaled = camera_intrinsics.copy()
-            if original_image_shape is not None:
-                orig_h, orig_w = original_image_shape
-                K_scaled[0, 0] *= render_resolution / orig_w   # fx
-                K_scaled[0, 2] *= render_resolution / orig_w   # cx
-                K_scaled[1, 1] *= render_resolution / orig_h   # fy
-                K_scaled[1, 2] *= render_resolution / orig_h   # cy
+            # 5. Convert 3D points from camera space to object frame
+            #
+            # The 3D points are in camera space. We need them in the object's
+            # local coordinate frame for solvePnP.
+            #
+            # Current transform: p_cam = R @ (scale * p_obj) + t
+            # Inverse: p_obj = R^T @ (p_cam - t) / scale
+            points_3d_obj = (current_R.T @ (points_3d_cam - current_t).T).T / scale_factor
+
+            # 6. Refine pose using solvePnP
+            #
+            # solvePnP finds R, t such that:
+            #   p_image = K @ (R @ p_object + t)
+            #
+            # We use:
+            # - object_points: p_obj * scale (scaled object-frame points)
+            # - image_points: src_kps in full-image coordinates
+            #   (the actual 2D observations of the object in the real image)
+            # - camera_intrinsics: K for the full original image
+            #
+            # Convert source keypoints from crop coordinates to full-image
+            # coordinates so they match the full-image camera intrinsics.
+            src_kps_full = src_kps_valid.copy()
+            # Undo the render_resolution scaling first
+            src_kps_full[:, 0] /= w_ratio
+            src_kps_full[:, 1] /= h_ratio
+            # Add crop offset to get full-image coordinates
+            if obj.crop_offset is not None:
+                src_kps_full[:, 0] += obj.crop_offset[0]
+                src_kps_full[:, 1] += obj.crop_offset[1]
+            else:
+                # Fallback: estimate offset from 2D bbox
+                x1, y1 = obj.bbox_2d[:2].astype(float)
+                src_kps_full[:, 0] += x1
+                src_kps_full[:, 1] += y1
 
             refined_R, refined_t = refine_pose_with_correspondences(
+                object_points_3d=points_3d_obj * scale_factor,
+                image_points_2d=src_kps_full,
+                camera_intrinsics=camera_intrinsics.astype(np.float64),
                 current_rotation=current_R,
                 current_translation=current_t,
-                src_points_2d=src_kps_valid,
-                tgt_points_2d=tgt_kps_valid,
-                src_points_3d=points_3d,
-                camera_intrinsics=K_scaled,
-                scale_factor=scale_factor,
-                mesh=obj.mesh,
             )
 
             current_R = refined_R
@@ -401,16 +438,12 @@ class MARCORefiner:
 
         # Apply refined transform to get the final aligned mesh
         obj.aligned_mesh = obj.mesh.copy()
-        # First center at origin
         mesh_center = obj.aligned_mesh.bounds.mean(axis=0)
         obj.aligned_mesh.apply_translation(-mesh_center)
-        # Scale
         obj.aligned_mesh.apply_scale(scale_factor)
-        # Apply refined rotation
         T_rot = np.eye(4)
         T_rot[:3, :3] = current_R
         obj.aligned_mesh.apply_transform(T_rot)
-        # Apply refined translation
         obj.aligned_mesh.apply_translation(current_t)
 
         init_R = obj.initial_rotation if obj.initial_rotation is not None else np.eye(3)
@@ -436,7 +469,7 @@ class MARCORefiner:
             objects: List of DetectedObject with aligned meshes
             camera_intrinsics: (3,3) camera intrinsic matrix
             render_resolution: Resolution for rendering meshes
-            original_image_shape: (H, W) of the original image, for intrinsics scaling
+            original_image_shape: (H, W) of the original image
 
         Returns:
             Updated list of DetectedObject with refined poses
