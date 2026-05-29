@@ -37,8 +37,14 @@ class Hunyuan3DGenerator:
     Takes masked object images and generates high-fidelity 3D meshes
     with optional PBR textures.
 
+    When low_vram_mode=True (recommended for T4 15GB):
+      - Shape pipeline loaded with low_cpu_mem_usage=True to minimise system RAM
+      - Texture (paint) pipeline is NOT loaded by default; enable explicitly
+      - octree_resolution reduced to 256 (from 384) to cut peak VRAM
+      - num_inference_steps reduced to 30 (from 50) to reduce intermediate tensors
+
     Example:
-        >>> generator = Hunyuan3DGenerator(enable_flashvdm=True)
+        >>> generator = Hunyuan3DGenerator(enable_flashvdm=True, low_vram_mode=True)
         >>> generator.load_model()
         >>> mesh = generator.generate_mesh(cropped_image, output_path="obj.glb")
     """
@@ -61,6 +67,7 @@ class Hunyuan3DGenerator:
         realesrgan_ckpt: str = "hy3dpaint/ckpt/RealESRGAN_x4plus.pth",
         device: str = "cuda",
         dtype: str = "float16",
+        low_vram_mode: bool = True,
     ):
         """Initialize Hunyuan3D generator.
 
@@ -98,6 +105,28 @@ class Hunyuan3DGenerator:
         self.realesrgan_ckpt = realesrgan_ckpt
         self.device = device
         self.dtype = dtype
+        self.low_vram_mode = low_vram_mode
+
+        # In low VRAM mode, apply conservative defaults that reduce peak memory
+        if self.low_vram_mode:
+            if self.octree_resolution > 256:
+                logger.info(
+                    f"Low VRAM: reducing octree_resolution "
+                    f"{self.octree_resolution}→256 to save GPU memory"
+                )
+                self.octree_resolution = 256
+            if self.num_inference_steps > 30:
+                logger.info(
+                    f"Low VRAM: reducing num_inference_steps "
+                    f"{self.num_inference_steps}→30 to save GPU memory"
+                )
+                self.num_inference_steps = 30
+            if self.generate_texture:
+                logger.info(
+                    "Low VRAM: disabling texture generation by default "
+                    "(re-enable with --texture or low_vram_mode=False)"
+                )
+                self.generate_texture = False
 
         self.shape_pipeline = None
         self.paint_pipeline = None
@@ -223,11 +252,27 @@ class Hunyuan3DGenerator:
                 f"Original error: {e}"
             )
 
+        # Load shape pipeline — low_cpu_mem_usage=True loads weights in
+        # shards directly to the target device, keeping system RAM ~1-2 GB
+        # instead of peaking at 2× model size (~10 GB for fp32 staging).
+        logger.info(
+            f"Loading shape pipeline (low_cpu_mem_usage={self.low_vram_mode})..."
+        )
         self.shape_pipeline = Hunyuan3DDiTFlowMatchingPipeline.from_pretrained(
             self.model_path,
             subfolder=self.subfolder,
             torch_dtype=torch_dtype,
+            low_cpu_mem_usage=self.low_vram_mode,
         )
+
+        # Move pipeline to the target device (if not already placed by
+        # low_cpu_mem_usage + device_map, move explicitly)
+        try:
+            self.shape_pipeline = self.shape_pipeline.to(self.device)
+        except Exception:
+            # Some pipelines already place sub-modules on device via
+            # low_cpu_mem_usage; .to() may fail if mixed placement.
+            pass
 
         # Enable FlashVDM
         if self.enable_flashvdm:
@@ -240,7 +285,8 @@ class Hunyuan3DGenerator:
                 replace_vae=True,
             )
 
-        # Load texture pipeline (optional)
+        # Load texture pipeline (optional — skipped in low_vram_mode unless
+        # explicitly requested)
         if self.generate_texture:
             logger.info("Loading Hunyuan3D-2.1 texture pipeline...")
             try:
@@ -275,13 +321,19 @@ class Hunyuan3DGenerator:
                 )
                 self.paint_pipeline = None
 
-        # Load background remover
+        # Load background remover (lightweight)
         try:
             from hy3dshape.rembg import BackgroundRemover
             self.rembg = BackgroundRemover()
         except ImportError:
             logger.warning("BackgroundRemover not available; input images must have transparent backgrounds")
             self.rembg = None
+
+        # After loading, reclaim any temporary CPU memory from deserialization
+        import gc
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         logger.info("Hunyuan3D-2.1 model loaded successfully")
 
@@ -332,6 +384,45 @@ class Hunyuan3DGenerator:
 
         pil_image = Image.fromarray(rgba, mode="RGBA")
         return pil_image, crop_mask
+
+    def unload_model(self):
+        """Unload all Hunyuan3D pipelines from GPU / CPU memory.
+
+        Frees both the shape pipeline and the (optional) paint pipeline,
+        then forces Python garbage-collection and CUDA cache clear.
+        """
+        import gc
+
+        if self.shape_pipeline is not None:
+            logger.info("Unloading Hunyuan3D shape pipeline...")
+            # Move to CPU first to free GPU allocations before deleting
+            try:
+                self.shape_pipeline = self.shape_pipeline.to("cpu")
+            except Exception:
+                pass
+            del self.shape_pipeline
+            self.shape_pipeline = None
+
+        if self.paint_pipeline is not None:
+            logger.info("Unloading Hunyuan3D paint pipeline...")
+            try:
+                del self.paint_pipeline
+            except Exception:
+                pass
+            self.paint_pipeline = None
+
+        if self.rembg is not None:
+            try:
+                del self.rembg
+            except Exception:
+                pass
+            self.rembg = None
+
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+        logger.info("Hunyuan3D models unloaded, GPU cache cleared")
 
     def generate_mesh(
         self,

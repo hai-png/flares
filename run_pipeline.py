@@ -169,6 +169,7 @@ Examples:
     parser.add_argument("--steps", type=int, default=None, help="Hunyuan3D denoising steps")
     parser.add_argument("--guidance", type=float, default=None, help="Hunyuan3D guidance scale")
     parser.add_argument("--no-texture", action="store_true", help="Skip texture generation")
+    parser.add_argument("--texture", action="store_true", help="Force-enable texture generation (even in low VRAM mode)")
     parser.add_argument("--refinement-iters", type=int, default=None, help="MARCO refinement iterations")
     parser.add_argument("--preload", action="store_true", help="Pre-load all models before running (ignored in low VRAM mode)")
     parser.add_argument("--no-low-vram", action="store_true", help="Disable low VRAM mode (keep all models in GPU, needs ~25GB)")
@@ -235,6 +236,9 @@ Examples:
         pipeline.generator.guidance_scale = args.guidance
     if args.no_texture:
         pipeline.generator.generate_texture = False
+    elif args.texture:
+        pipeline.generator.generate_texture = True
+        logger.info("Texture generation force-enabled (may use additional GPU memory)")
     if args.refinement_iters is not None:
         pipeline.refiner.refinement_iterations = args.refinement_iters
 

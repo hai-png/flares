@@ -202,7 +202,8 @@ $PYTHON_CMD -m pip install --quiet \
     pymeshlab \
     pyyaml \
     accelerate \
-    xatlas 2>/dev/null || {
+    xatlas \
+    psutil 2>/dev/null || {
     echo "  ⚠ Some Hunyuan3D deps failed. Trying individually..."
     $PYTHON_CMD -m pip install --quiet pymeshlab 2>/dev/null || echo "  ⚠ pymeshlab install failed"
     $PYTHON_CMD -m pip install --quiet pyyaml 2>/dev/null || echo "  ⚠ pyyaml install failed"
@@ -581,9 +582,12 @@ else:
 " 2>&1
 
 echo ""
-echo "To run the pipeline:"
+echo "To run the pipeline (low VRAM mode, recommended for T4):"
 echo "  cd $PROJECT_DIR"
-echo "  python run_pipeline.py --image <path_to_image> --preload"
+echo "  python run_pipeline.py --image <path_to_image>"
+echo ""
+echo "To run with textures enabled (needs more GPU memory):"
+echo "  python run_pipeline.py --image <path_to_image> --texture"
 echo ""
 echo "To check environment only:"
 echo "  python run_pipeline.py --check-env"

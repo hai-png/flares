@@ -52,3 +52,8 @@ pipeline:
   min_object_area: 100              # Min pixel area for an object mask to process
   background_color: [255, 255, 255] # Background color for masked crops
   low_vram_mode: true               # Load/unload models stage-by-stage (required for T4 15GB)
+  # When low_vram_mode=true, Hunyuan3D automatically applies these overrides:
+  #   octree_resolution: 256  (from 384)
+  #   num_inference_steps: 30 (from 50)
+  #   generate_texture: false (from true)
+  # Override with --texture flag to re-enable textures in low VRAM mode.

@@ -184,6 +184,7 @@ class SceneReconstructionPipeline:
             octree_resolution=hunyuan3d_octree_resolution,
             generate_texture=hunyuan3d_generate_texture,
             device=device,
+            low_vram_mode=low_vram_mode,
         )
 
         self.refiner = MARCORefiner(
@@ -250,38 +251,82 @@ class SceneReconstructionPipeline:
 
     @staticmethod
     def _gpu_mem_info() -> str:
-        """Return a short GPU memory summary string."""
+        """Return a short GPU + system memory summary string."""
+        parts = []
         try:
             import torch
             if torch.cuda.is_available():
                 alloc = torch.cuda.memory_allocated() / 1024**3
                 reserved = torch.cuda.memory_reserved() / 1024**3
                 total = torch.cuda.get_device_properties(0).total_mem / 1024**3
-                return f"GPU: {alloc:.1f}/{total:.1f}GB used, {reserved:.1f}GB reserved"
+                parts.append(f"GPU: {alloc:.1f}/{total:.1f}GB alloc, {reserved:.1f}GB reserved")
         except Exception:
             pass
-        return ""
+        try:
+            import psutil
+            vm = psutil.virtual_memory()
+            used_gb = vm.used / 1024**3
+            total_gb = vm.total / 1024**3
+            parts.append(f"RAM: {used_gb:.1f}/{total_gb:.1f}GB")
+        except ImportError:
+            pass
+        return " | ".join(parts) if parts else ""
+
+    def _free_memory(self):
+        """Aggressively free GPU and CPU memory before loading a new model.
+
+        Runs Python garbage collection and clears the CUDA cache.
+        Call this BEFORE loading a model to ensure maximum free memory.
+        """
+        import gc
+        import torch
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
 
     def _unload_model(self, module_name: str):
         """Unload a model from GPU memory to free VRAM.
 
-        Sets the model reference to None and calls CUDA garbage collection.
-        The model will be re-loaded on next use (lazy loading).
+        Moves the model to CPU first, then deletes it and runs garbage
+        collection. The model will be re-loaded on next use (lazy loading).
         """
+        unloaded = False
+
         if module_name == "detector" and self.detector.model is not None:
-            logger.info(f"Unloading RF-DETR from GPU to free VRAM... {self._gpu_mem_info()}")
+            logger.info(f"Unloading RF-DETR from GPU... {self._gpu_mem_info()}")
+            try:
+                self.detector.model = self.detector.model.cpu()
+            except Exception:
+                pass
+            del self.detector.model
             self.detector.model = None
+            unloaded = True
         elif module_name == "estimator_3d" and self.estimator_3d.model is not None:
-            logger.info(f"Unloading WildDet3D from GPU to free VRAM... {self._gpu_mem_info()}")
+            logger.info(f"Unloading WildDet3D from GPU... {self._gpu_mem_info()}")
+            try:
+                self.estimator_3d.model = self.estimator_3d.model.cpu()
+            except Exception:
+                pass
+            del self.estimator_3d.model
             self.estimator_3d.model = None
+            unloaded = True
         elif module_name == "generator" and self.generator.shape_pipeline is not None:
-            logger.info(f"Unloading Hunyuan3D from GPU to free VRAM... {self._gpu_mem_info()}")
-            self.generator.shape_pipeline = None
-            self.generator.paint_pipeline = None
+            logger.info(f"Unloading Hunyuan3D from GPU... {self._gpu_mem_info()}")
+            # Use the dedicated unload method for thorough cleanup
+            self.generator.unload_model()
+            unloaded = True
         elif module_name == "refiner" and self.refiner.model is not None:
-            logger.info(f"Unloading MARCO from GPU to free VRAM... {self._gpu_mem_info()}")
+            logger.info(f"Unloading MARCO from GPU... {self._gpu_mem_info()}")
+            try:
+                self.refiner.model = self.refiner.model.cpu()
+            except Exception:
+                pass
+            del self.refiner.model
             self.refiner.model = None
-        else:
+            unloaded = True
+
+        if not unloaded:
             return  # Nothing to unload
 
         import gc
@@ -378,6 +423,10 @@ class SceneReconstructionPipeline:
         logger.info("Stage 1: RF-DETR — 2D Detection + Segmentation")
         logger.info("=" * 60)
 
+        # Free any stale GPU/CPU memory before starting
+        self._free_memory()
+        logger.info(f"Memory before Stage 1: {self._gpu_mem_info()}")
+
         objects = self.detector.detect(
             image,
             min_area=self.min_object_area,
@@ -407,6 +456,10 @@ class SceneReconstructionPipeline:
         logger.info("Stage 2: WildDet3D — 3D Bounding Box Estimation")
         logger.info("=" * 60)
 
+        # Ensure maximum free memory before loading WildDet3D
+        self._free_memory()
+        logger.info(f"Memory before Stage 2: {self._gpu_mem_info()}")
+
         objects = self.estimator_3d.estimate_3d(
             image, objects, intrinsics=intrinsics, class_names=class_names
         )
@@ -427,6 +480,11 @@ class SceneReconstructionPipeline:
         logger.info("Stage 3: Hunyuan3D-2.1 + FlashVDM — 3D Mesh Generation")
         logger.info("=" * 60)
 
+        # CRITICAL: Free every last byte before loading Hunyuan3D — it's
+        # the largest model and both GPU *and* system RAM are very tight.
+        self._free_memory()
+        logger.info(f"Memory before Stage 3: {self._gpu_mem_info()}")
+
         mesh_dir = os.path.join(output_dir, "meshes")
         objects = self.generator.generate_meshes_for_objects(
             image, objects, output_dir=mesh_dir
@@ -445,6 +503,9 @@ class SceneReconstructionPipeline:
         logger.info("=" * 60)
         logger.info("Stage 4: Scale + Pose Alignment (3D Bounding Boxes)")
         logger.info("=" * 60)
+
+        self._free_memory()
+        logger.info(f"Memory before Stage 4: {self._gpu_mem_info()}")
 
         for obj in objects:
             if obj.mesh is None or obj.bbox_3d is None:
@@ -491,6 +552,9 @@ class SceneReconstructionPipeline:
         logger.info("=" * 60)
         logger.info("Stage 5: MARCO — Pose Refinement")
         logger.info("=" * 60)
+
+        self._free_memory()
+        logger.info(f"Memory before Stage 5: {self._gpu_mem_info()}")
 
         if camera_intrinsics is not None:
             objects = self.refiner.refine_poses(

@@ -25,6 +25,7 @@ setup(
         "huggingface_hub>=0.19",
         "safetensors>=0.4",
         "supervision>=0.18",
+        "psutil>=5.9",
     ],
     extras_require={
         "full": [
