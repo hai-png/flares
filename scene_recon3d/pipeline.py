@@ -576,8 +576,12 @@ class SceneReconstructionPipeline:
             with open(os.path.join(output_dir, "3_mesh_debug.json"), "w") as f:
                 json.dump(mesh_debug, f, indent=2)
 
-        # Free Hunyuan3D from GPU — it's the heaviest model and Stage 4 is CPU-only
-        if self.low_vram_mode:
+        # Free Hunyuan3D from GPU — always unload before MARCO, even in
+        # non-low-VRAM mode, because MARCO needs significant GPU memory
+        # (DINOv2-giant + feature extraction) and Hunyuan3D is not needed
+        # for Stages 4 or 5.  On a T4 (14.5 GB), keeping Hunyuan3D loaded
+        # leaves only ~300 MB free, causing MARCO to OOM.
+        if self.generator.shape_pipeline is not None:
             self._unload_model("generator")
 
         # ═══════════════════════════════════════════════════════════

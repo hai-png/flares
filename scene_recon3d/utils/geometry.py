@@ -134,6 +134,44 @@ def _compute_alignment_2d_iou(
         return 0.0
 
 
+def _generate_cube_rotations():
+    """Generate all 24 proper rotation matrices of a cube (det=+1).
+
+    These are all 3×3 matrices with entries in {-1, 0, 1} that are
+    proper rotations (orthogonal, det=+1).  They form the octahedral
+    rotation group and cover every possible axis permutation with
+    an even number of sign flips.
+
+    Returns:
+        List of (name, 3×3 rotation matrix) tuples
+    """
+    rotations = []
+    idx = 0
+
+    # Enumerate all 3×3 matrices with entries in {-1, 0, 1} that have
+    # exactly one non-zero entry per row and per column (permutation with
+    # signs), and determinant = +1.
+    for i in range(3):
+        for si in (-1, 1):
+            for j in range(3):
+                if j == i:
+                    continue
+                for sj in (-1, 1):
+                    for k in range(3):
+                        if k == i or k == j:
+                            continue
+                        for sk in (-1, 1):
+                            R = np.zeros((3, 3), dtype=np.float64)
+                            R[0, i] = si
+                            R[1, j] = sj
+                            R[2, k] = sk
+                            if np.linalg.det(R) > 0:
+                                rotations.append((f"R{idx}", R))
+                                idx += 1
+
+    return rotations
+
+
 def align_mesh_to_bbox(
     mesh: trimesh.Trimesh,
     bbox_center: np.ndarray,
@@ -213,21 +251,22 @@ def align_mesh_to_bbox(
 
     # ── Candidate permutations ────────────────────────────────────
     # The generated mesh may not have a predictable alignment of its
-    # principal axes with the bbox axes.  We test four 90° rotations
-    # around the Y axis (which preserve the Y-up / Y-down relationship)
-    # and pick the one with the best 2D projection IoU.
+    # principal axes with the bbox axes.  We test all 24 proper
+    # rotations of a cube (the rotation group SO(3)∩Z^3) instead of
+    # just 4 Y-rotations.  This is critical for objects like potted
+    # plants where the mesh's "tall" axis may not correspond to Y.
     #
-    # All four are proper rotations (det = +1):
-    #   0°: identity
-    #   90°: rotates X→-Z, Z→X
-    #  180°: rotates X→-X, Z→-Z
-    #  270°: rotates X→Z, Z→-X
-    R_perms = [
-        ("0deg", np.eye(3, dtype=np.float64)),
-        ("90deg", np.array([[0, 0, -1], [0, 1, 0], [1, 0, 0]], dtype=np.float64)),
-        ("180deg", np.array([[-1, 0, 0], [0, 1, 0], [0, 0, -1]], dtype=np.float64)),
-        ("270deg", np.array([[0, 0, 1], [0, 1, 0], [-1, 0, 0]], dtype=np.float64)),
-    ]
+    # Each rotation is a 3×3 permutation matrix with det=+1 (proper
+    # rotation, no reflection).  There are exactly 24 such matrices:
+    #   - Identity
+    #   - 3 rotations (90/180/270) around each of X, Y, Z (9 total)
+    #   - 6 rotations (180) around each of the 6 face diagonals
+    #   - 8 rotations (120/240) around each of the 4 space diagonals
+    #
+    # Since we already apply R_axis (Y-up→Y-down flip), we only need
+    # rotations in the Y-up mesh frame.  The 2D IoU validation will
+    # filter out physically implausible orientations.
+    R_perms = _generate_cube_rotations()
 
     # Compute per-candidate scale factors and test 2D IoU.
     #
@@ -237,13 +276,19 @@ def align_mesh_to_bbox(
     #
     # The permuted mesh extents are: extents_perm[i] = sum_j |R_perm[i,j]| * mesh_extents[j]
     # (because R_perm permutes/reflects axes, and extents are always positive)
+    #
+    # Scale factor: we use np.min(ratios) to guarantee the mesh fits
+    # INSIDE the bounding box on all axes.  This avoids the overflow
+    # problem where np.median or np.mean allows the mesh to exceed the
+    # bbox in some dimensions, causing terrible 2D projection overlap.
     candidates = []
     for name, R_perm in R_perms:
         # Compute the effective extent that each bbox axis "sees"
         # after the permutation is applied to the mesh.
         extents_perm = np.abs(R_perm) @ mesh_extents_safe
         ratios = bbox_dims_mapped / np.maximum(extents_perm, 1e-6)
-        sf = float(np.median(ratios))
+        # Use minimum ratio to guarantee the mesh fits inside the bbox
+        sf = float(np.min(ratios))
         candidates.append((name, R_perm, sf, ratios))
 
     # ── Select the best candidate ─────────────────────────────────
@@ -268,7 +313,7 @@ def align_mesh_to_bbox(
 
         best_name, R_perm, scale_factor, scale_ratios = candidates[best_idx]
         logger.info(
-            f"  2D validation: tested 4 Y-rotations, "
+            f"  2D validation: tested {len(candidates)} rotations, "
             f"chose {best_name}, best_IoU={best_iou:.3f}"
         )
     else:

@@ -336,6 +336,23 @@ class Hunyuan3DGenerator:
         if self.generate_texture:
             logger.info("Loading Hunyuan3D-2.1 texture pipeline...")
             try:
+                # ── Pre-import fixups ────────────────────────────────
+                # The paint pipeline's dependencies import modules that
+                # may not be available in all environments.  We mock them
+                # in sys.modules so the imports succeed; any function that
+                # actually *calls* the missing module will raise at runtime,
+                # which is fine since we never call bpy-dependent functions
+                # (we use save_glb=False).
+
+                # Mock bpy (Blender Python API) — required by
+                # DifferentiableRenderer.mesh_utils.convert_obj_to_glb.
+                # We never call that function (save_glb=False), but the
+                # top-level import still needs the module to exist.
+                if "bpy" not in sys.modules:
+                    import types
+                    sys.modules["bpy"] = types.ModuleType("bpy")
+                    logger.debug("Mocked bpy module for paint pipeline import")
+
                 # Apply torchvision compatibility fix before importing the paint
                 # pipeline.  RealESRGAN (loaded inside the paint pipeline)
                 # imports torchvision.transforms.functional_tensor which was

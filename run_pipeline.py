@@ -115,6 +115,11 @@ def check_environment():
         logger.warning(f"Hunyuan3D-Shape not available: {e}")
 
     try:
+        # Mock bpy if not installed — the paint pipeline imports it at the
+        # top level but we don't call bpy-dependent functions (save_glb=False)
+        if "bpy" not in sys.modules:
+            import types
+            sys.modules["bpy"] = types.ModuleType("bpy")
         from textureGenPipeline import Hunyuan3DPaintPipeline
         checks["Hunyuan3D-Paint"] = True
     except ImportError:

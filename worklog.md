@@ -56,3 +56,39 @@ Stage Summary:
 - All 5 modules working together in a unified pipeline
 - Pipeline supports: full reconstruction, individual stage testing, config-driven customization
 - Output: Combined GLB scene file with all objects in unified 3D space
+
+---
+Task ID: 10
+Agent: Main Agent
+Task: Fix Hunyuan3D texture painting bugs
+
+Work Log:
+- Cloned upstream Hunyuan3D-2.1 repo to repos/Hunyuan3D-2.1/
+- Read upstream textureGenPipeline.py in detail — found Hunyuan3DPaintPipeline.__call__ signature
+- Read upstream demo.py, model_worker.py, gradio_app.py for correct usage patterns
+- Read upstream convert_utils.py for OBJ→GLB PBR conversion
+- Identified 5 critical bugs in flares texture painting implementation
+- Fixed all 5 bugs in hunyuan3d_generator.py
+- Added _convert_textured_obj_to_glb() method with PBR material support
+- Added torchvision_fix application before paint pipeline import
+- Pushed fix to GitHub (commit 82b2169)
+
+Bug #1: image_path=None CRASH — upstream pipeline doesn't handle None; causes NameError
+  Fix: Pass PIL RGBA image directly (pipeline accepts PIL.Image.Image)
+
+Bug #2: output_mesh_path uses .glb extension — pipeline writes OBJ, corrupting the file
+  Fix: Use .obj extension for paint pipeline output, then convert to GLB
+
+Bug #3: save_glb=True requires Blender (bpy) — never installed in server environments
+  Fix: Use save_glb=False and convert OBJ→GLB ourselves (matching upstream model_worker.py)
+
+Bug #4: Return value mishandled — pipeline returns .obj path, code loads from .glb path
+  Fix: Use return value to locate OBJ, then convert to GLB
+
+Bug #5: Missing torchvision_fix — RealESRGAN imports functional_tensor removed in torchvision >= 0.17
+  Fix: Apply torchvision_fix before loading paint pipeline
+
+Stage Summary:
+- All 5 texture painting bugs fixed and pushed to repo
+- Texture painting now follows the same pattern as upstream model_worker.py
+- PBR GLB conversion tries convert_utils first, falls back to trimesh
