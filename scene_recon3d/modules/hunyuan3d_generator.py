@@ -336,6 +336,20 @@ class Hunyuan3DGenerator:
         if self.generate_texture:
             logger.info("Loading Hunyuan3D-2.1 texture pipeline...")
             try:
+                # Apply torchvision compatibility fix before importing the paint
+                # pipeline.  RealESRGAN (loaded inside the paint pipeline)
+                # imports torchvision.transforms.functional_tensor which was
+                # removed in torchvision >= 0.17.  The fix monkey-patches a
+                # compatible module so the import succeeds.
+                try:
+                    from utils.torchvision_fix import apply_fix
+                    apply_fix()
+                    logger.info("Applied torchvision compatibility fix")
+                except ImportError:
+                    logger.debug("torchvision_fix not found, skipping")
+                except Exception as e:
+                    logger.debug(f"torchvision_fix failed: {e}")
+
                 from textureGenPipeline import Hunyuan3DPaintPipeline, Hunyuan3DPaintConfig
 
                 # Find config and checkpoint paths
@@ -504,6 +518,62 @@ class Hunyuan3DGenerator:
             torch.cuda.ipc_collect()
         logger.info("Hunyuan3D models unloaded, GPU cache cleared")
 
+    def _convert_textured_obj_to_glb(
+        self, obj_path: str, glb_path: str
+    ) -> str:
+        """Convert a textured OBJ file (with PBR sidecar textures) to GLB.
+
+        Tries the upstream Hunyuan3D convert_utils for full PBR material
+        support (combining metallic + roughness into the glTF metallic-
+        roughness texture).  Falls back to a simple trimesh conversion
+        if pygltflib is unavailable.
+
+        Args:
+            obj_path: Path to the textured OBJ file from the paint pipeline
+            glb_path: Desired output GLB path
+
+        Returns:
+            Path to the written GLB file
+        """
+        # Attempt 1: Use the upstream convert_utils for proper PBR GLB
+        # This combines metallic and roughness maps into the glTF ORM
+        # texture and embeds all texture images via pygltflib.
+        try:
+            from hy3dpaint.convert_utils import create_glb_with_pbr_materials
+
+            textures = {
+                "albedo": obj_path.replace(".obj", ".jpg"),
+                "metallic": obj_path.replace(".obj", "_metallic.jpg"),
+                "roughness": obj_path.replace(".obj", "_roughness.jpg"),
+            }
+            # Only include texture files that actually exist
+            textures = {k: v for k, v in textures.items() if os.path.isfile(v)}
+
+            create_glb_with_pbr_materials(obj_path, textures, glb_path)
+            if os.path.isfile(glb_path):
+                logger.info("Converted textured OBJ → GLB with PBR materials")
+                return glb_path
+        except (ImportError, Exception) as e:
+            logger.debug(
+                f"PBR GLB conversion via convert_utils failed ({e}); "
+                "falling back to trimesh conversion"
+            )
+
+        # Attempt 2: Simple trimesh-based OBJ → GLB conversion.
+        # This preserves the albedo/diffuse texture but may lose
+        # metallic/roughness PBR maps.
+        try:
+            loaded = trimesh.load(obj_path)
+            if isinstance(loaded, trimesh.Scene):
+                loaded.export(glb_path)
+            else:
+                loaded.export(glb_path)
+            logger.info("Converted textured OBJ → GLB via trimesh")
+            return glb_path
+        except Exception as e:
+            logger.warning(f"GLB conversion failed: {e}")
+            return obj_path  # Return OBJ path as last resort
+
     def generate_mesh(
         self,
         image: Image.Image,
@@ -632,30 +702,87 @@ class Hunyuan3DGenerator:
         if self.paint_pipeline is not None and output_path:
             logger.info("Generating PBR textures...")
             try:
-                # Save untextured mesh temporarily
+                # Save untextured mesh as GLB (paint pipeline accepts GLB/OBJ)
                 untextured_path = output_path.replace(".glb", "_untextured.glb")
                 mesh.export(untextured_path)
 
-                # Generate textured mesh
-                textured_path = self.paint_pipeline(
-                    mesh_path=untextured_path,
-                    image_path=None,  # Will use the same image
-                    output_mesh_path=output_path,
-                    save_glb=True,
+                # The paint pipeline's __call__ signature is:
+                #   (mesh_path, image_path, output_mesh_path, use_remesh, save_glb)
+                #
+                # CRITICAL: image_path MUST be provided — passing None causes a
+                # NameError inside the pipeline because image_prompt is never
+                # assigned.  The pipeline accepts either a file-path string or a
+                # PIL.Image.Image object directly (no need to save to disk).
+                # We pass the same RGBA image used for shape generation as the
+                # style reference for texture painting.
+                #
+                # CRITICAL: save_glb=True requires Blender (bpy) which is
+                # almost never installed in server environments.  The upstream
+                # model_worker.py and gradio_app.py both use save_glb=False
+                # and convert OBJ→GLB themselves.  We follow the same pattern.
+                #
+                # CRITICAL: output_mesh_path must end with .obj — the paint
+                # pipeline saves an OBJ file (with sidecar .mtl + textures).
+                # Passing a .glb path causes OBJ data to be written with the
+                # wrong extension, corrupting the file.
+                output_dir = os.path.dirname(output_path) or "."
+                obj_output_path = os.path.join(
+                    output_dir,
+                    os.path.basename(output_path).replace(".glb", "_textured.obj"),
                 )
 
-                # Reload the textured mesh
-                loaded = trimesh.load(output_path)
-                # trimesh.load may return a Scene for multi-geometry GLBs;
-                # convert to a single Trimesh for consistent downstream use.
+                textured_obj_path = self.paint_pipeline(
+                    mesh_path=untextured_path,
+                    image_path=image,  # PIL Image — used as style reference
+                    output_mesh_path=obj_output_path,
+                    save_glb=False,     # Avoid Blender dependency
+                )
+
+                # The paint pipeline returns the path to the textured .obj file.
+                # Convert OBJ → GLB, preserving PBR materials when possible.
+                #
+                # The paint pipeline generates these sidecar files alongside
+                # the OBJ:
+                #   textured_mesh.mtl     — material definitions
+                #   textured_mesh.jpg     — albedo/diffuse texture
+                #   textured_mesh_metallic.jpg — metallic map (PBR)
+                #   textured_mesh_roughness.jpg — roughness map (PBR)
+                #
+                # For best PBR quality, use the upstream convert_utils which
+                # combines metallic+roughness into the glTF ORM texture and
+                # embeds all maps via pygltflib.  Fall back to a simple
+                # trimesh-based conversion if pygltflib is unavailable.
+                glb_path = self._convert_textured_obj_to_glb(
+                    textured_obj_path, output_path
+                )
+
+                # Reload the final GLB mesh for downstream use
+                loaded = trimesh.load(glb_path)
                 if isinstance(loaded, trimesh.Scene):
                     mesh = loaded.to_mesh()
                 else:
                     mesh = loaded
 
-                # Clean up temp file
-                if os.path.exists(untextured_path):
-                    os.remove(untextured_path)
+                # Clean up temporary files (untextured GLB, textured OBJ,
+                # sidecar MTL/texture files, and remesh artifacts)
+                obj_dir = os.path.dirname(obj_output_path) or "."
+                obj_base = os.path.splitext(os.path.basename(obj_output_path))[0]
+                temp_patterns = [
+                    untextured_path,
+                    obj_output_path,
+                    os.path.join(obj_dir, obj_base + ".mtl"),
+                    os.path.join(obj_dir, obj_base + ".jpg"),
+                    os.path.join(obj_dir, obj_base + "_metallic.jpg"),
+                    os.path.join(obj_dir, obj_base + "_roughness.jpg"),
+                    # Remesh intermediate file created by the paint pipeline
+                    os.path.join(obj_dir, "white_mesh_remesh.obj"),
+                ]
+                for temp_path in temp_patterns:
+                    if os.path.exists(temp_path):
+                        try:
+                            os.remove(temp_path)
+                        except OSError:
+                            pass
 
             except Exception as e:
                 logger.warning(f"Texture generation failed: {e}. Using untextured mesh.")
@@ -663,8 +790,8 @@ class Hunyuan3DGenerator:
                 # output path was never written, so we must save here)
                 mesh.export(output_path)
 
-        # Save if path provided
-        if output_path and not (self.paint_pipeline is not None):
+        # Save if path provided and paint pipeline was not used
+        if output_path and self.paint_pipeline is None:
             mesh.export(output_path)
 
         n_verts = len(mesh.vertices)
