@@ -117,7 +117,13 @@ $PYTHON_CMD -m pip install --upgrade pip "setuptools<82" wheel
 
 # Install core deps without strict version pins.
 # These are shared across multiple pipeline components.
+# Pin numpy<2.0 to avoid conflicts with pandas, scikit-learn, vis4d,
+# and pymeshlab's OpenSSL linkage.  rembg>=2.0.50 requires numpy>=2.3,
+# so we install rembg<2.0.50 which works with numpy 1.x.
+# NEVER install rembg[gpu] — it pulls numpy>=2.3 and onnxruntime-gpu
+# which break the pymeshlab → OpenSSL → huggingface_hub import chain.
 $PYTHON_CMD -m pip install --quiet \
+    "numpy>=1.24,<2.0" \
     omegaconf \
     pyyaml \
     opencv-python-headless \
@@ -130,7 +136,7 @@ $PYTHON_CMD -m pip install --quiet \
     huggingface_hub \
     safetensors \
     supervision \
-    rembg \
+    "rembg>=2.0,<2.0.50" \
     pygltflib
 
 # ─── 4. Install the scene_recon3d package ──────────────────────

@@ -24,6 +24,32 @@ if _this_dir not in sys.path:
 import numpy as np
 
 
+def _check_numpy_compat():
+    """Warn early if numpy>=2.0 is installed, which breaks the environment.
+
+    Installing rembg[gpu] or onnxruntime-gpu can pull in numpy>=2.3,
+    which triggers a library conflict: pymeshlab's bundled libcrypto.so.3
+    needs OPENSSL_3.3.0, and the updated numpy/onnxruntime stack changes
+    the shared-library loading order so that huggingface_hub (and thus
+    RF-DETR, Hunyuan3D) fail to import.
+
+    Fix: pip install "numpy>=1.24,<2.0"
+    """
+    major = int(np.__version__.split(".")[0])
+    if major >= 2:
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.warning(
+            f"NumPy {np.__version__} detected — this is likely incompatible. "
+            f"Several pipeline components (RF-DETR, Hunyuan3D) depend on "
+            f"pymeshlab which conflicts with numpy>=2.0 via OpenSSL linkage. "
+            f"Run: pip install \"numpy>=1.24,<2.0\" to fix."
+        )
+
+
+_check_numpy_compat()
+
+
 def _suppress_pymeshlab_warnings():
     """Import pymeshlab while suppressing noisy plugin-loading warnings.
 

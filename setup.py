@@ -12,7 +12,7 @@ setup(
     install_requires=[
         "torch>=2.2.0",
         "torchvision>=0.17.0",
-        "numpy>=1.24",
+        "numpy>=1.24,<2.0",
         "opencv-python-headless>=4.8",
         "Pillow>=10.0",
         "scipy>=1.11",
@@ -33,7 +33,7 @@ setup(
             "transformers>=5.1.0,<6.0.0",
             "diffusers>=0.30",
             "accelerate>=1.1",
-            "rembg>=2.0",
+            "rembg>=2.0,<2.1",
             "timm>=1.0",
             "pyrender",
             "open3d>=0.18",
