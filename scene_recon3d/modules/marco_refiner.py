@@ -318,18 +318,30 @@ class MARCORefiner:
                 )
                 continue
 
-            # Resize source image to match render resolution for MARCO
-            src_image = cv2.resize(
-                obj.crop_image, (render_resolution, render_resolution)
-            )
-
-            # Scale source keypoints to render resolution
+            # Resize source image to match render resolution for MARCO.
+            # Preserve aspect ratio by padding the shorter side instead of
+            # non-uniform stretching, which distorts keypoints and confuses
+            # MARCO's correspondence matching.
             crop_h, crop_w = obj.crop_image.shape[:2]
-            h_ratio = render_resolution / crop_h
-            w_ratio = render_resolution / crop_w
+            scale_to_render = render_resolution / max(crop_h, crop_w)
+            new_w = int(round(crop_w * scale_to_render))
+            new_h = int(round(crop_h * scale_to_render))
+            src_resized = cv2.resize(obj.crop_image, (new_w, new_h))
+
+            # Pad to square (bottom-right padding, matching MARCO convention)
+            pad_x = render_resolution - new_w
+            pad_y = render_resolution - new_h
+            src_image = np.full(
+                (render_resolution, render_resolution, 3), 255, dtype=np.uint8
+            )
+            src_image[:new_h, :new_w] = src_resized
+
+            # Scale source keypoints to the padded-square space.
+            # Because the image is top-left aligned with bottom-right padding,
+            # keypoints are simply scaled by the uniform scale factor.
             src_kps_scaled = src_keypoints.copy()
-            src_kps_scaled[:, 0] *= w_ratio
-            src_kps_scaled[:, 1] *= h_ratio
+            src_kps_scaled[:, 0] *= scale_to_render
+            src_kps_scaled[:, 1] *= scale_to_render
 
             # 3. Find correspondences using MARCO
             try:
@@ -370,14 +382,21 @@ class MARCORefiner:
             # Approach: Use the depth buffer from rendering to unproject
             # the 2D target keypoints to 3D camera-space points.
             #
-            # Build the scaled camera intrinsics for the render resolution
+            # Build the scaled camera intrinsics for the render resolution.
+            # Scale fx, fy, cx, cy uniformly so that the rendered image
+            # preserves the original aspect ratio without distortion.
+            # For a non-square original image rendered to a square canvas,
+            # we use the minimum scale factor (fit the longer side) and
+            # adjust the principal point to center the shorter dimension.
             K_scaled = camera_intrinsics.copy().astype(np.float64)
             if original_image_shape is not None:
                 orig_h, orig_w = original_image_shape
-                K_scaled[0, 0] *= render_resolution / orig_w
-                K_scaled[0, 2] *= render_resolution / orig_w
-                K_scaled[1, 1] *= render_resolution / orig_h
-                K_scaled[1, 2] *= render_resolution / orig_h
+                # Uniform scale: fit the longer side to render_resolution
+                uniform_scale = render_resolution / max(orig_h, orig_w)
+                K_scaled[0, 0] *= uniform_scale
+                K_scaled[0, 2] *= uniform_scale
+                K_scaled[1, 1] *= uniform_scale
+                K_scaled[1, 2] *= uniform_scale
 
             try:
                 # Use depth buffer to get 3D points in camera space
@@ -443,9 +462,9 @@ class MARCORefiner:
             # Convert source keypoints from crop coordinates to full-image
             # coordinates so they match the full-image camera intrinsics.
             src_kps_full = src_kps_valid.copy()
-            # Undo the render_resolution scaling first
-            src_kps_full[:, 0] /= w_ratio
-            src_kps_full[:, 1] /= h_ratio
+            # Undo the uniform scale_to_render scaling first
+            src_kps_full[:, 0] /= scale_to_render
+            src_kps_full[:, 1] /= scale_to_render
             # Now keypoints are in crop_image pixel coordinates.
             # If the crop was resized (crop_scale != 1.0), undo that too
             # to get back to the original (un-resized) crop coordinates
@@ -472,13 +491,31 @@ class MARCORefiner:
                 current_translation=current_t,
             )
 
-            # Validate refined pose - reject implausibly large changes
+            # Validate refined pose - reject implausibly large changes.
+            # Thresholds are relative to the object size and distance so
+            # that small nearby objects and large distant objects are
+            # treated consistently.
             rot_diff = np.linalg.norm(refined_R - current_R)
             trans_diff = np.linalg.norm(refined_t - current_t)
-            if rot_diff > 1.5 or trans_diff > 3.0:
+
+            # Compute a size-aware translation threshold based on the
+            # object's 3D bounding box diagonal.  A translation change
+            # larger than half the object diagonal is almost certainly wrong.
+            if obj.bbox_3d_dims is not None:
+                obj_diag = float(np.linalg.norm(obj.bbox_3d_dims))
+                max_trans_diff = max(0.5 * obj_diag, 0.1)  # at least 10cm
+            else:
+                max_trans_diff = 3.0  # fallback for missing bbox dims
+
+            # Rotation threshold: more than ~60 degrees (1.05 rad) is
+            # almost certainly a catastrophic PnP failure.
+            max_rot_diff = 1.05
+
+            if rot_diff > max_rot_diff or trans_diff > max_trans_diff:
                 logger.warning(
                     f"Object {obj.object_id}: rejecting large pose change "
-                    f"(rot_diff={rot_diff:.3f}, trans_diff={trans_diff:.3f}). "
+                    f"(rot_diff={rot_diff:.3f}>{max_rot_diff:.3f} or "
+                    f"trans_diff={trans_diff:.3f}>{max_trans_diff:.3f}). "
                     f"Keeping previous pose."
                 )
             else:

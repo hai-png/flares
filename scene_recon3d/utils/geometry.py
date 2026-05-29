@@ -89,8 +89,14 @@ def _compute_alignment_2d_iou(
 ) -> float:
     """Compute 2D IoU between a mesh's projection and a 2D bounding box.
 
-    Projects the mesh's axis-aligned bounding box corners to 2D and
-    computes IoU with the detected 2D bbox.
+    Projects the mesh's oriented bounding box (OBB) corners to 2D and
+    computes IoU with the detected 2D bbox.  Uses the OBB instead of the
+    AABB because the aligned mesh is typically rotated, making the AABB
+    much larger than the actual mesh silhouette and producing misleading
+    IoU values.
+
+    Only in-front-of-camera corners are used for the 2D bbox computation.
+    If fewer than 3 corners are in front of the camera, returns 0.0.
 
     Args:
         mesh: Transformed mesh (already in camera space)
@@ -98,30 +104,42 @@ def _compute_alignment_2d_iou(
         camera_intrinsics: (3,3) camera K matrix
 
     Returns:
-        IoU value (0.0 if no overlap)
+        IoU value (0.0 if no overlap or too few visible corners)
     """
     try:
-        bounds = mesh.bounds  # (2, 3) min, max
-        mins, maxs = bounds
-        corners = np.array([
-            [mins[0], mins[1], mins[2]],
-            [maxs[0], mins[1], mins[2]],
-            [maxs[0], maxs[1], mins[2]],
-            [mins[0], maxs[1], mins[2]],
-            [mins[0], mins[1], maxs[2]],
-            [maxs[0], mins[1], maxs[2]],
-            [maxs[0], maxs[1], maxs[2]],
-            [mins[0], maxs[1], maxs[2]],
-        ])
-        corners_2d = project_points_to_2d(corners, camera_intrinsics)
-        px1 = corners_2d[:, 0].min()
-        py1 = corners_2d[:, 1].min()
-        px2 = corners_2d[:, 0].max()
-        py2 = corners_2d[:, 1].max()
+        # Use oriented bounding box for tighter fit on rotated meshes
+        try:
+            obb = mesh.bounding_box_oriented
+            corners_3d = obb.vertices  # (8, 3) OBB corners
+        except Exception:
+            # Fallback to axis-aligned bounding box
+            bounds = mesh.bounds  # (2, 3) min, max
+            mins, maxs = bounds
+            corners_3d = np.array([
+                [mins[0], mins[1], mins[2]],
+                [maxs[0], mins[1], mins[2]],
+                [maxs[0], maxs[1], mins[2]],
+                [mins[0], maxs[1], mins[2]],
+                [mins[0], mins[1], maxs[2]],
+                [maxs[0], mins[1], maxs[2]],
+                [maxs[0], maxs[1], maxs[2]],
+                [mins[0], maxs[1], maxs[2]],
+            ])
 
-        # Filter out invalid (behind-camera) projections
-        if px1 < -1e5 or py1 < -1e5:
+        corners_2d, in_front = project_points_to_2d(
+            corners_3d, camera_intrinsics, return_validity=True,
+        )
+
+        # Only use corners in front of the camera
+        valid_corners = corners_2d[in_front]
+        if len(valid_corners) < 3:
             return 0.0
+
+        # Use np.nanmin/nanmax as safety net for any remaining NaN
+        px1 = float(np.nanmin(valid_corners[:, 0]))
+        py1 = float(np.nanmin(valid_corners[:, 1]))
+        px2 = float(np.nanmax(valid_corners[:, 0]))
+        py2 = float(np.nanmax(valid_corners[:, 1]))
 
         dx1, dy1, dx2, dy2 = bbox_2d.tolist()
 
@@ -221,7 +239,7 @@ def align_mesh_to_bbox(
     mesh_extents = mesh.extents  # (3,) size along each axis in Y-up frame
     mesh_center = mesh.bounds.mean(axis=0)
 
-    # Identify degenerate mesh dimensions
+    # Identify degenerate mesh dimensions (nearly flat or zero extent)
     DEGENERATE_THRESHOLD = 0.05
     max_extent = float(np.max(mesh_extents))
     degenerate_mask = mesh_extents < (max_extent * DEGENERATE_THRESHOLD)
@@ -235,6 +253,9 @@ def align_mesh_to_bbox(
             f"These axes will be excluded from scale ratio computation."
         )
 
+    # Clamp mesh extents to a minimum to avoid division-by-near-zero.
+    # The clamp value should be relative to the bbox dimensions, not a
+    # fixed absolute epsilon, because scale ratios are dimensionless.
     mesh_extents_safe = np.maximum(mesh_extents, 1e-6)
 
     # Remap bbox dimensions
@@ -254,7 +275,13 @@ def align_mesh_to_bbox(
     def _select_scale(ratios, deg_mask, strategy):
         valid_ratios = ratios[~deg_mask]
         if len(valid_ratios) == 0:
-            return float(np.min(ratios))
+            # All axes are degenerate — use the median of the
+            # non-infinite ratios to avoid extreme scale factors
+            # caused by dividing near-zero extents into bbox dims.
+            finite_ratios = ratios[np.isfinite(ratios)]
+            if len(finite_ratios) > 0:
+                return float(np.median(finite_ratios))
+            return 1.0  # ultimate fallback
         if strategy == "min":
             return float(np.min(valid_ratios))
         elif strategy == "median":
@@ -375,15 +402,20 @@ def bbox3d_to_corners_opencv(
 def project_points_to_2d(
     points_3d: np.ndarray,
     camera_intrinsics: np.ndarray,
-) -> np.ndarray:
+    return_validity: bool = False,
+) -> np.ndarray | Tuple[np.ndarray, np.ndarray]:
     """Project 3D points to 2D image coordinates.
 
     Args:
         points_3d: (N, 3) 3D points in camera coordinates
         camera_intrinsics: (3, 3) camera intrinsic matrix
+        return_validity: If True, also return a boolean mask indicating
+                         which points are in front of the camera.
 
     Returns:
-        (N, 2) 2D pixel coordinates (u, v)
+        (N, 2) 2D pixel coordinates (u, v).
+        If return_validity=True, also returns (N,) boolean mask where True
+        means the point is in front of the camera (z > 0).
     """
     fx = camera_intrinsics[0, 0]
     fy = camera_intrinsics[1, 1]
@@ -392,20 +424,23 @@ def project_points_to_2d(
 
     # Project: u = fx * X/Z + cx, v = fy * Y/Z + cy
     z = points_3d[:, 2]
-    z_safe = np.where(np.abs(z) > 1e-6, z, 1e-6)
+    in_front = z > 0
+    z_safe = np.where(in_front, z, 1.0)  # dummy z for behind-camera points
 
     u = fx * points_3d[:, 0] / z_safe + cx
     v = fy * points_3d[:, 1] / z_safe + cy
 
-    # Points behind the camera (z <= 0) produce invalid projections.
-    # Clamp them to large negative values so they fall outside any
-    # reasonable image bounds and are naturally excluded by downstream
-    # min/max filtering.
-    behind = z <= 0
-    u[behind] = -1e6
-    v[behind] = -1e6
+    # Invalidate behind-camera projections with NaN so downstream code
+    # can explicitly filter them out rather than being corrupted by
+    # sentinel values in min/max operations.
+    u[~in_front] = np.nan
+    v[~in_front] = np.nan
 
-    return np.stack([u, v], axis=1)
+    result = np.stack([u, v], axis=1)
+
+    if return_validity:
+        return result, in_front
+    return result
 
 
 def draw_bbox3d_on_image(
@@ -432,7 +467,9 @@ def draw_bbox3d_on_image(
         Image with 3D bounding box drawn
     """
     corners_3d = bbox3d_to_corners_opencv(bbox_center, bbox_dims, bbox_quat)
-    corners_2d = project_points_to_2d(corners_3d, camera_intrinsics)
+    corners_2d, in_front = project_points_to_2d(
+        corners_3d, camera_intrinsics, return_validity=True,
+    )
 
     # Draw edges connecting the 8 corners
     # Bottom face: 0-1-2-3-0, Top face: 4-5-6-7-4, Verticals: 0-4, 1-5, 2-6, 3-7
@@ -445,6 +482,9 @@ def draw_bbox3d_on_image(
     vis = image.copy()
     h, w = vis.shape[:2]
     for i, j in edges:
+        # Skip edges where either endpoint is behind the camera
+        if not in_front[i] or not in_front[j]:
+            continue
         pt1 = corners_2d[i].astype(int)
         pt2 = corners_2d[j].astype(int)
         # Only draw if both points are reasonably within image bounds
@@ -513,6 +553,26 @@ def refine_pose_with_correspondences(
     # Convert Rodrigues vector to rotation matrix
     refined_R, _ = cv2.Rodrigues(rvec)
     refined_t = tvec.flatten()
+
+    # Validate PnP result by computing reprojection error.
+    # Reject the refined pose if the mean reprojection error exceeds
+    # a threshold relative to the image diagonal, which prevents
+    # grossly incorrect PnP solutions from corrupting the alignment.
+    projected, _ = cv2.projectPoints(obj_pts, rvec, tvec, K, dist_coeffs)
+    projected = projected.squeeze(1)  # (N, 2)
+    reproj_err = np.sqrt(np.sum((projected - img_pts) ** 2, axis=1))
+    mean_reproj_err = float(np.mean(reproj_err))
+
+    # Threshold: 5% of the image diagonal (approximated from cx, cy)
+    image_diag = np.sqrt(K[0, 2] ** 2 + K[1, 2] ** 2) * 2.8
+    max_reproj_err = 0.05 * image_diag
+
+    if mean_reproj_err > max_reproj_err:
+        logger.debug(
+            f"PnP reprojection error too large ({mean_reproj_err:.1f}px > "
+            f"{max_reproj_err:.1f}px); keeping current pose"
+        )
+        return current_rotation, current_translation
 
     return refined_R, refined_t
 
@@ -610,15 +670,18 @@ def render_mesh(
         cx = camera_intrinsics[0, 2]
         cy = camera_intrinsics[1, 2]
 
-        # Scale intrinsics from original image resolution to render resolution
+        # Scale intrinsics from original image resolution to render resolution.
+        # Use a uniform scale factor (based on the longer side) to avoid
+        # distorting the rendering when the original image is non-square.
+        # This preserves the original aspect ratio in the rendered square
+        # image, with the shorter dimension centered.
         if original_image_shape is not None:
             orig_h, orig_w = original_image_shape
-            scale_x = resolution / orig_w
-            scale_y = resolution / orig_h
-            fx *= scale_x
-            fy *= scale_y
-            cx *= scale_x
-            cy *= scale_y
+            uniform_scale = resolution / max(orig_h, orig_w)
+            fx *= uniform_scale
+            fy *= uniform_scale
+            cx *= uniform_scale
+            cy *= uniform_scale
     else:
         # Default: fit camera to see the whole mesh
         fx = fy = resolution

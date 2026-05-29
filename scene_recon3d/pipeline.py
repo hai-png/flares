@@ -509,11 +509,15 @@ class SceneReconstructionPipeline:
                         # Add label
                         corners_3d = obj.bbox_3d_center.reshape(1, 3)
                         from .utils.geometry import project_points_to_2d
-                        center_2d = project_points_to_2d(corners_3d, camera_intrinsics)[0]
-                        label = f"{obj.class_name} (3D: {obj.score_3d:.2f})"
-                        cv2.putText(vis_3d, label,
-                                    (int(center_2d[0]) - 40, int(center_2d[1]) - 10),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+                        center_2d, center_in_front = project_points_to_2d(
+                            corners_3d, camera_intrinsics, return_validity=True,
+                        )
+                        if center_in_front[0]:
+                            center_2d = center_2d[0]
+                            label = f"{obj.class_name} (3D: {obj.score_3d:.2f})"
+                            cv2.putText(vis_3d, label,
+                                        (int(center_2d[0]) - 40, int(center_2d[1]) - 10),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
                 cv2.imwrite(os.path.join(output_dir, "2_bbox3d_projection.png"),
                             cv2.cvtColor(vis_3d, cv2.COLOR_RGB2BGR))
 
@@ -666,37 +670,42 @@ class SceneReconstructionPipeline:
                     # Validation: project aligned mesh bounding box back to 2D
                     # and compare with original 2D detection
                     if camera_intrinsics is not None and obj.bbox_2d is not None:
+                        from .utils.geometry import _compute_alignment_2d_iou
+                        iou = _compute_alignment_2d_iou(
+                            obj.aligned_mesh, obj.bbox_2d, camera_intrinsics
+                        )
+
+                        # Also compute projected 2D bbox for debug logging
                         from .utils.geometry import project_points_to_2d
-                        # Get the 8 corners of the aligned mesh's bounding box
-                        aligned_bounds = obj.aligned_mesh.bounds  # (2, 3) min, max
-                        mins, maxs = aligned_bounds
-                        corners = np.array([
-                            [mins[0], mins[1], mins[2]],
-                            [maxs[0], mins[1], mins[2]],
-                            [maxs[0], maxs[1], mins[2]],
-                            [mins[0], maxs[1], mins[2]],
-                            [mins[0], mins[1], maxs[2]],
-                            [maxs[0], mins[1], maxs[2]],
-                            [maxs[0], maxs[1], maxs[2]],
-                            [mins[0], maxs[1], maxs[2]],
-                        ])
-                        corners_2d = project_points_to_2d(corners, camera_intrinsics)
-                        proj_x1 = corners_2d[:, 0].min()
-                        proj_y1 = corners_2d[:, 1].min()
-                        proj_x2 = corners_2d[:, 0].max()
-                        proj_y2 = corners_2d[:, 1].max()
+                        try:
+                            obb = obj.aligned_mesh.bounding_box_oriented
+                            corners_3d = obb.vertices
+                        except Exception:
+                            aligned_bounds = obj.aligned_mesh.bounds
+                            mins, maxs = aligned_bounds
+                            corners_3d = np.array([
+                                [mins[0], mins[1], mins[2]],
+                                [maxs[0], mins[1], mins[2]],
+                                [maxs[0], maxs[1], mins[2]],
+                                [mins[0], maxs[1], mins[2]],
+                                [mins[0], mins[1], maxs[2]],
+                                [maxs[0], mins[1], maxs[2]],
+                                [maxs[0], maxs[1], maxs[2]],
+                                [mins[0], maxs[1], maxs[2]],
+                            ])
+                        corners_2d, in_front = project_points_to_2d(
+                            corners_3d, camera_intrinsics, return_validity=True,
+                        )
+                        valid_2d = corners_2d[in_front]
+                        if len(valid_2d) >= 3:
+                            proj_x1 = float(np.nanmin(valid_2d[:, 0]))
+                            proj_y1 = float(np.nanmin(valid_2d[:, 1]))
+                            proj_x2 = float(np.nanmax(valid_2d[:, 0]))
+                            proj_y2 = float(np.nanmax(valid_2d[:, 1]))
+                        else:
+                            proj_x1 = proj_y1 = proj_x2 = proj_y2 = 0.0
 
                         det_x1, det_y1, det_x2, det_y2 = obj.bbox_2d.tolist()
-
-                        # Compute IoU between projected and detected 2D boxes
-                        ix1 = max(proj_x1, det_x1)
-                        iy1 = max(proj_y1, det_y1)
-                        ix2 = min(proj_x2, det_x2)
-                        iy2 = min(proj_y2, det_y2)
-                        inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
-                        area_proj = (proj_x2 - proj_x1) * (proj_y2 - proj_y1)
-                        area_det = (det_x2 - det_x1) * (det_y2 - det_y1)
-                        iou = inter / max(area_proj + area_det - inter, 1e-6)
 
                         debug_info["reprojection_2d"] = {
                             "projected_bbox_xyxy": [proj_x1, proj_y1, proj_x2, proj_y2],
@@ -721,33 +730,41 @@ class SceneReconstructionPipeline:
                 vis_align = image.copy()
                 for i, obj in enumerate(objects):
                     if obj.aligned_mesh is not None and obj.bbox_2d is not None:
-                        from .utils.geometry import project_points_to_2d
+                        from .utils.geometry import project_points_to_2d, _compute_alignment_2d_iou
                         # Draw detected 2D bbox (green)
                         x1, y1, x2, y2 = obj.bbox_2d.astype(int)
                         cv2.rectangle(vis_align, (x1, y1), (x2, y2), (0, 255, 0), 2)
 
                         # Draw projected aligned mesh bbox (red)
-                        aligned_bounds = obj.aligned_mesh.bounds
-                        mins, maxs = aligned_bounds
-                        corners = np.array([
-                            [mins[0], mins[1], mins[2]],
-                            [maxs[0], mins[1], mins[2]],
-                            [maxs[0], maxs[1], mins[2]],
-                            [mins[0], maxs[1], mins[2]],
-                            [mins[0], mins[1], maxs[2]],
-                            [maxs[0], mins[1], maxs[2]],
-                            [maxs[0], maxs[1], maxs[2]],
-                            [mins[0], maxs[1], maxs[2]],
-                        ])
-                        corners_2d = project_points_to_2d(corners, camera_intrinsics).astype(int)
-                        px1, py1 = corners_2d[:, 0].min(), corners_2d[:, 1].min()
-                        px2, py2 = corners_2d[:, 0].max(), corners_2d[:, 1].max()
-                        cv2.rectangle(vis_align, (px1, py1), (px2, py2), (255, 0, 0), 2)
+                        # Use OBB for tighter fit on rotated meshes
+                        try:
+                            obb = obj.aligned_mesh.bounding_box_oriented
+                            corners_3d = obb.vertices
+                        except Exception:
+                            aligned_bounds = obj.aligned_mesh.bounds
+                            mins, maxs = aligned_bounds
+                            corners_3d = np.array([
+                                [mins[0], mins[1], mins[2]],
+                                [maxs[0], mins[1], mins[2]],
+                                [maxs[0], maxs[1], mins[2]],
+                                [mins[0], maxs[1], mins[2]],
+                                [mins[0], mins[1], maxs[2]],
+                                [maxs[0], mins[1], maxs[2]],
+                                [maxs[0], maxs[1], maxs[2]],
+                                [mins[0], maxs[1], maxs[2]],
+                            ])
+                        corners_2d, in_front = project_points_to_2d(
+                            corners_3d, camera_intrinsics, return_validity=True,
+                        )
+                        valid_2d = corners_2d[in_front]
+                        if len(valid_2d) >= 3:
+                            px1 = int(np.nanmin(valid_2d[:, 0]))
+                            py1 = int(np.nanmin(valid_2d[:, 1]))
+                            px2 = int(np.nanmax(valid_2d[:, 0]))
+                            py2 = int(np.nanmax(valid_2d[:, 1]))
+                            cv2.rectangle(vis_align, (px1, py1), (px2, py2), (255, 0, 0), 2)
 
-                        # Label
-                        iou_val = 0.0
                         # Compute IoU between projected aligned mesh and 2D detection
-                        from .utils.geometry import _compute_alignment_2d_iou
                         iou_val = _compute_alignment_2d_iou(
                             obj.aligned_mesh, obj.bbox_2d, camera_intrinsics
                         )
