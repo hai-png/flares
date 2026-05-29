@@ -347,12 +347,24 @@ class Hunyuan3DGenerator:
                 )
                 self.paint_pipeline = None
 
-        # Load background remover (lightweight)
+        # Load background remover (optional — the pipeline already produces
+        # RGBA images with transparent backgrounds from segmentation masks,
+        # so rembg is only needed for images that lack an alpha channel.)
         try:
             from hy3dshape.rembg import BackgroundRemover
             self.rembg = BackgroundRemover()
-        except ImportError:
-            logger.warning("BackgroundRemover not available; input images must have transparent backgrounds")
+        except Exception as e:
+            # Catch *all* exceptions, not just ImportError:
+            # - ImportError: rembg package not installed
+            # - OSError / RuntimeError: onnxruntime missing or incompatible
+            #   (onnxruntime-gpu requires numpy>=2.3 which breaks pymeshlab)
+            logger.info(
+                "BackgroundRemover not available "
+                f"({type(e).__name__}: {e}). "
+                "Pipeline will use segmentation masks for background removal "
+                "instead of rembg. If you want rembg, install onnxruntime "
+                "(CPU): pip install onnxruntime"
+            )
             self.rembg = None
 
         # After loading, reclaim any temporary CPU memory from deserialization
@@ -480,7 +492,14 @@ class Hunyuan3DGenerator:
         # Ensure RGBA with transparent background
         if image.mode != "RGBA":
             if self.rembg is not None:
-                image = self.rembg(image)
+                try:
+                    image = self.rembg(image)
+                except Exception as e:
+                    logger.warning(
+                        f"rembg background removal failed ({e}); "
+                        "falling back to simple RGBA conversion"
+                    )
+                    image = image.convert("RGBA")
             else:
                 image = image.convert("RGBA")
 
