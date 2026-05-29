@@ -267,6 +267,20 @@ class MARCORefiner:
         current_t = obj.initial_translation if obj.initial_translation is not None else np.zeros(3)
         scale_factor = obj.scale_factor if obj.scale_factor is not None else 1.0
 
+        # Simplify mesh for ray casting if very dense
+        MARCO_MAX_FACES = 50000
+        work_mesh = obj.mesh
+        if work_mesh is not None and len(work_mesh.faces) > MARCO_MAX_FACES:
+            try:
+                work_mesh = work_mesh.simplify_quadric_decimation(face_count=MARCO_MAX_FACES)
+                logger.info(
+                    f"Object {obj.object_id}: decimated mesh from "
+                    f"{len(obj.mesh.faces)} to {len(work_mesh.faces)} faces for MARCO"
+                )
+            except Exception as e:
+                logger.debug(f"Mesh decimation failed ({e}); using original mesh")
+                work_mesh = obj.mesh
+
         # Iterative refinement
         for iteration in range(self.refinement_iterations):
             logger.info(
@@ -285,7 +299,7 @@ class MARCORefiner:
 
             try:
                 rendered_image, depth_map = render_mesh_for_marco(
-                    obj.mesh,
+                    work_mesh,
                     current_transform,
                     camera_intrinsics,
                     resolution=render_resolution,
@@ -293,7 +307,16 @@ class MARCORefiner:
                 )
             except Exception as e:
                 logger.warning(f"Rendering failed for object {obj.object_id}: {e}")
-                break
+                continue
+
+            # Check if rendering produced a visible result
+            has_valid_depth = depth_map is not None and np.any(depth_map > 0)
+            if not has_valid_depth:
+                logger.info(
+                    f"Object {obj.object_id}: depth buffer empty at iteration "
+                    f"{iteration + 1} - skipping"
+                )
+                continue
 
             # Resize source image to match render resolution for MARCO
             src_image = cv2.resize(
@@ -317,7 +340,7 @@ class MARCORefiner:
                 logger.warning(
                     f"MARCO correspondence failed for object {obj.object_id}: {e}"
                 )
-                break
+                continue
 
             # Filter valid correspondences (within image bounds)
             valid = (
@@ -332,7 +355,7 @@ class MARCORefiner:
                     f"Too few valid correspondences ({len(src_kps_valid)}) "
                     f"for object {obj.object_id}"
                 )
-                break
+                continue
 
             # Store correspondence points
             obj.correspondence_points_src = src_kps_valid
@@ -358,33 +381,33 @@ class MARCORefiner:
 
             try:
                 # Use depth buffer to get 3D points in camera space
-                has_valid_depth = depth_map is not None and np.any(depth_map > 0)
+                points_3d_cam = unproject_depth_to_3d(
+                    tgt_kps_valid, depth_map, K_scaled,
+                )
 
-                if has_valid_depth:
-                    points_3d_cam = unproject_depth_to_3d(
-                        tgt_kps_valid, depth_map, K_scaled,
-                    )
-                else:
-                    # Fall back to ray casting against the mesh in camera space
+                # Filter out zero-valued points (failed extractions)
+                valid_3d = np.any(points_3d_cam != 0, axis=1)
+
+                # If depth buffer gave too few points, try ray casting
+                if valid_3d.sum() < 6:
                     logger.info(
-                        f"Object {obj.object_id}: depth buffer empty, "
-                        "falling back to ray casting"
+                        f"Object {obj.object_id}: depth unprojection yielded "
+                        f"only {valid_3d.sum()} valid points, trying ray casting"
                     )
                     points_3d_cam = get_mesh_3d_points_for_2d_keypoints(
-                        obj.mesh,
+                        work_mesh,
                         tgt_kps_valid,
                         K_scaled,
                         mesh_transform=current_transform,
                     )
+                    valid_3d = np.any(points_3d_cam != 0, axis=1)
 
-                # Filter out zero-valued points (failed extractions)
-                valid_3d = np.any(points_3d_cam != 0, axis=1)
                 if valid_3d.sum() < 4:
                     logger.warning(
                         f"Object {obj.object_id}: too few valid 3D points "
                         f"({valid_3d.sum()}); skipping this iteration"
                     )
-                    break
+                    continue
 
                 # Keep only valid points
                 tgt_kps_valid = tgt_kps_valid[valid_3d]
@@ -395,7 +418,7 @@ class MARCORefiner:
                 logger.warning(
                     f"3D point extraction failed for object {obj.object_id}: {e}"
                 )
-                break
+                continue
 
             # 5. Convert 3D points from camera space to object frame
             #
@@ -449,8 +472,18 @@ class MARCORefiner:
                 current_translation=current_t,
             )
 
-            current_R = refined_R
-            current_t = refined_t
+            # Validate refined pose - reject implausibly large changes
+            rot_diff = np.linalg.norm(refined_R - current_R)
+            trans_diff = np.linalg.norm(refined_t - current_t)
+            if rot_diff > 1.5 or trans_diff > 3.0:
+                logger.warning(
+                    f"Object {obj.object_id}: rejecting large pose change "
+                    f"(rot_diff={rot_diff:.3f}, trans_diff={trans_diff:.3f}). "
+                    f"Keeping previous pose."
+                )
+            else:
+                current_R = refined_R
+                current_t = refined_t
 
         # Update the object with refined pose
         obj.refined_rotation = current_R

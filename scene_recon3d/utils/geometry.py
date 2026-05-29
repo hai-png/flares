@@ -216,88 +216,65 @@ def align_mesh_to_bbox(
     # Get mesh bounding box
     mesh_extents = mesh.extents  # (3,) size along each axis in Y-up frame
     mesh_center = mesh.bounds.mean(axis=0)
+
+    # Identify degenerate mesh dimensions
+    DEGENERATE_THRESHOLD = 0.05
+    max_extent = float(np.max(mesh_extents))
+    degenerate_mask = mesh_extents < (max_extent * DEGENERATE_THRESHOLD)
+    n_degenerate = int(np.sum(degenerate_mask))
+
+    if n_degenerate > 0:
+        deg_axes = [i for i in range(3) if degenerate_mask[i]]
+        logger.warning(
+            f"  Degenerate mesh dimensions detected: "
+            f"extents={mesh_extents}, degenerate axes={deg_axes}. "
+            f"These axes will be excluded from scale ratio computation."
+        )
+
     mesh_extents_safe = np.maximum(mesh_extents, 1e-6)
 
-    # ── Remap bbox dimensions to match mesh axes ──────────────────
-    #
-    # WildDet3D bbox_dims = (W, L, H) where:
-    #   W → bbox local Z ↔ mesh -Z (depth, with direction flip)
-    #   L → bbox local X ↔ mesh X (width)
-    #   H → bbox local Y ↔ mesh -Y (height, with up/down flip)
-    #
-    # Direct correspondence (before axis conversion):
-    #   bbox local (X, Y, Z) = (L, H, W)
-    #   mesh (X, Y, Z) in the canonical Y-up frame maps to:
-    #     mesh X → bbox X (L), mesh Y → bbox -Y (H), mesh Z → bbox -Z (W)
-    #
-    # After R_axis (Y-up→Y-down, Z-toward→Z-forward), the extents match
-    # directly because R_axis only flips signs (preserving magnitude).
+    # Remap bbox dimensions
     W, L, H = float(bbox_dims[0]), float(bbox_dims[1]), float(bbox_dims[2])
     bbox_dims_mapped = np.array([L, H, W], dtype=np.float64)
 
-    # ── Rotation from quaternion ──────────────────────────────────
     R_quat = quaternion_to_rotation_matrix(bbox_quat)
 
-    # ── Axis convention conversion ────────────────────────────────
-    # Hunyuan3D mesh: X-right, Y-up, Z-toward-viewer
-    # OpenCV camera:  X-right, Y-down, Z-forward
-    # Conversion: (x, y, z)_mesh → (x, -y, -z)_opencv
-    # diag(1, -1, -1) is a proper rotation (det = +1).
     R_axis = np.array([
         [1,  0,  0],
         [0, -1,  0],
         [0,  0, -1],
     ], dtype=np.float64)
 
-    # ── Candidate permutations ────────────────────────────────────
-    # The generated mesh may not have a predictable alignment of its
-    # principal axes with the bbox axes.  We test all 24 proper
-    # rotations of a cube (the rotation group SO(3)∩Z^3) instead of
-    # just 4 Y-rotations.  This is critical for objects like potted
-    # plants where the mesh's "tall" axis may not correspond to Y.
-    #
-    # Each rotation is a 3×3 permutation matrix with det=+1 (proper
-    # rotation, no reflection).  There are exactly 24 such matrices:
-    #   - Identity
-    #   - 3 rotations (90/180/270) around each of X, Y, Z (9 total)
-    #   - 6 rotations (180) around each of the 6 face diagonals
-    #   - 8 rotations (120/240) around each of the 4 space diagonals
-    #
-    # Since we already apply R_axis (Y-up→Y-down flip), we only need
-    # rotations in the Y-up mesh frame.  The 2D IoU validation will
-    # filter out physically implausible orientations.
     R_perms = _generate_cube_rotations()
 
-    # Compute per-candidate scale factors and test 2D IoU.
-    #
-    # For each permutation R_perm, the effective dimension mapping is:
-    #   p_bbox = R_perm @ p_mesh  (after centering & axis conversion)
-    # So bbox_dims_mapped must be compared against the permuted mesh extents.
-    #
-    # The permuted mesh extents are: extents_perm[i] = sum_j |R_perm[i,j]| * mesh_extents[j]
-    # (because R_perm permutes/reflects axes, and extents are always positive)
-    #
-    # Scale factor: we use np.min(ratios) to guarantee the mesh fits
-    # INSIDE the bounding box on all axes.  This avoids the overflow
-    # problem where np.median or np.mean allows the mesh to exceed the
-    # bbox in some dimensions, causing terrible 2D projection overlap.
+    def _select_scale(ratios, deg_mask, strategy):
+        valid_ratios = ratios[~deg_mask]
+        if len(valid_ratios) == 0:
+            return float(np.min(ratios))
+        if strategy == "min":
+            return float(np.min(valid_ratios))
+        elif strategy == "median":
+            return float(np.median(valid_ratios))
+        elif strategy == "max":
+            return float(np.max(valid_ratios))
+        else:
+            return float(np.min(valid_ratios))
+
+    # Build candidate list: (name, R_perm, scale_factor, ratios, strategy)
     candidates = []
     for name, R_perm in R_perms:
-        # Compute the effective extent that each bbox axis "sees"
-        # after the permutation is applied to the mesh.
         extents_perm = np.abs(R_perm) @ mesh_extents_safe
         ratios = bbox_dims_mapped / np.maximum(extents_perm, 1e-6)
-        # Use minimum ratio to guarantee the mesh fits inside the bbox
-        sf = float(np.min(ratios))
-        candidates.append((name, R_perm, sf, ratios))
+        perm_degenerate = (extents_perm < max_extent * DEGENERATE_THRESHOLD)
+        for strategy in ("min", "median", "max"):
+            sf = _select_scale(ratios, perm_degenerate, strategy)
+            candidates.append((name, R_perm, sf, ratios, strategy))
 
-    # ── Select the best candidate ─────────────────────────────────
+    # Select the best candidate using 2D IoU
     if camera_intrinsics is not None and bbox_2d is not None:
-        # Test each candidate by computing 2D projection IoU
         best_iou = -1.0
         best_idx = 0
-
-        for idx, (name, R_perm, sf, ratios) in enumerate(candidates):
+        for idx, (name, R_perm, sf, ratios, strategy) in enumerate(candidates):
             R = R_quat @ R_axis @ R_perm
             test_mesh = mesh.copy()
             test_mesh.apply_translation(-mesh_center)
@@ -310,42 +287,36 @@ def align_mesh_to_bbox(
             if iou > best_iou:
                 best_iou = iou
                 best_idx = idx
-
-        best_name, R_perm, scale_factor, scale_ratios = candidates[best_idx]
+        best_name, R_perm, scale_factor, scale_ratios, best_strategy = candidates[best_idx]
         logger.info(
-            f"  2D validation: tested {len(candidates)} rotations, "
-            f"chose {best_name}, best_IoU={best_iou:.3f}"
+            f"  2D validation: tested {len(candidates)} rotation+scale combos, "
+            f"chose {best_name}/{best_strategy}, best_IoU={best_iou:.3f}"
         )
     else:
-        # Without 2D validation, use the most balanced scale ratios
-        # (lowest coefficient of variation = std/mean)
         best_cv = float("inf")
         best_idx = 0
-        for idx, (name, R_perm, sf, ratios) in enumerate(candidates):
-            cv = np.std(ratios) / max(np.mean(ratios), 1e-6)
+        for idx, (name, R_perm, sf, ratios, strategy) in enumerate(candidates):
+            valid_ratios = ratios[~degenerate_mask]
+            if len(valid_ratios) == 0:
+                valid_ratios = ratios
+            cv = np.std(valid_ratios) / max(np.mean(valid_ratios), 1e-6)
             if cv < best_cv:
                 best_cv = cv
                 best_idx = idx
-        best_name, R_perm, scale_factor, scale_ratios = candidates[best_idx]
+        best_name, R_perm, scale_factor, scale_ratios, best_strategy = candidates[best_idx]
 
     R = R_quat @ R_axis @ R_perm
 
-    # Log detailed alignment info
     logger.info(
         f"  Scale computation: mesh_extents={mesh_extents}, "
         f"bbox_dims=(W={W:.3f}, L={L:.3f}, H={H:.3f}), "
         f"mapped=(L={L:.3f}, H={H:.3f}, W={W:.3f}), "
         f"scale_ratios={scale_ratios}, "
         f"scale={scale_factor:.4f}, "
-        f"perm={best_name}"
+        f"perm={best_name}, strategy={best_strategy}"
     )
 
-    # ── Build the full transformation ─────────────────────────────
-    # 1. Center the mesh at origin
-    # 2. Scale it
-    # 3. Rotate it (includes permutation + axis conversion + quaternion)
-    # 4. Translate to bbox center
-
+    # Build the full transformation
     centered_mesh = mesh.copy()
     centered_mesh.apply_translation(-mesh_center)
     centered_mesh.apply_scale(scale_factor)
@@ -499,18 +470,30 @@ def refine_pose_with_correspondences(
     Returns:
         Tuple of (refined_rotation, refined_translation)
     """
-    if len(object_points_3d) < 4:
+    n_pts = len(object_points_3d)
+    if n_pts < 4:
         return current_rotation, current_translation
 
     dist_coeffs = np.zeros((4, 1))  # No distortion
 
-    success, rvec, tvec = cv2.solvePnP(
-        object_points_3d.astype(np.float64),
-        image_points_2d.astype(np.float64),
-        camera_intrinsics.astype(np.float64),
-        dist_coeffs,
-        flags=cv2.SOLVEPNP_ITERATIVE,
-    )
+    obj_pts = object_points_3d.astype(np.float64)
+    img_pts = image_points_2d.astype(np.float64)
+    K = camera_intrinsics.astype(np.float64)
+
+    # Choose PnP algorithm based on correspondences count
+    if n_pts >= 6:
+        flags = cv2.SOLVEPNP_ITERATIVE
+    elif n_pts >= 4:
+        flags = cv2.SOLVEPNP_EPNP
+    else:
+        return current_rotation, current_translation
+
+    try:
+        success, rvec, tvec = cv2.solvePnP(
+            obj_pts, img_pts, K, dist_coeffs, flags=flags,
+        )
+    except cv2.error:
+        return current_rotation, current_translation
 
     if not success:
         return current_rotation, current_translation

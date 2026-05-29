@@ -351,6 +351,19 @@ class Hunyuan3DGenerator:
                 if "bpy" not in sys.modules:
                     import types
                     sys.modules["bpy"] = types.ModuleType("bpy")
+                # Mock realesrgan + basicsr
+                for mod_name in ("realesrgan", "basicsr", "basicsr.archs",
+                                 "basicsr.archs.rrdbnet_arch"):
+                    if mod_name not in sys.modules:
+                        import types as _types
+                        _mod = _types.ModuleType(mod_name)
+                        if mod_name == "basicsr.archs.rrdbnet_arch":
+                            class _StubRRDBNet:
+                                def __init__(self, *a, **kw):
+                                    pass
+                            _mod.RRDBNet = _StubRRDBNet
+                        sys.modules[mod_name] = _mod
+                        logger.debug(f"Mocked {mod_name} module for paint pipeline import")
                     logger.debug("Mocked bpy module for paint pipeline import")
 
                 # Apply torchvision compatibility fix before importing the paint
@@ -387,6 +400,29 @@ class Hunyuan3DGenerator:
                 conf.realesrgan_ckpt_path = realesrgan_path
                 conf.multiview_cfg_path = paint_cfg_path
                 conf.custom_pipeline = custom_pipeline_path
+
+                # Check if realesrgan is truly available
+                try:
+                    import realesrgan as _test_esrgan
+                    _has_realesrgan = True
+                except (ImportError, AttributeError):
+                    _has_realesrgan = False
+
+                if not _has_realesrgan:
+                    try:
+                        import utils.image_super_utils as _isu
+                        class _NoOpSuperNet:
+                            def __init__(self, config):
+                                pass
+                            def __call__(self, image):
+                                return image
+                        _isu.imageSuperNet = _NoOpSuperNet
+                        logger.info(
+                            "RealESRGAN not available - using no-op super-resolution "
+                            "(textures at base resolution without upscaling)"
+                        )
+                    except (ImportError, AttributeError):
+                        pass
 
                 self.paint_pipeline = Hunyuan3DPaintPipeline(conf)
                 logger.info("Texture pipeline loaded successfully")
