@@ -258,32 +258,58 @@ class Hunyuan3DGenerator:
         logger.info(
             f"Loading shape pipeline (low_cpu_mem_usage={self.low_vram_mode})..."
         )
-        self.shape_pipeline = Hunyuan3DDiTFlowMatchingPipeline.from_pretrained(
+        pipeline = Hunyuan3DDiTFlowMatchingPipeline.from_pretrained(
             self.model_path,
             subfolder=self.subfolder,
             torch_dtype=torch_dtype,
             low_cpu_mem_usage=self.low_vram_mode,
         )
 
-        # Move pipeline to the target device (if not already placed by
-        # low_cpu_mem_usage + device_map, move explicitly)
-        try:
-            self.shape_pipeline = self.shape_pipeline.to(self.device)
-        except Exception:
-            # Some pipelines already place sub-modules on device via
-            # low_cpu_mem_usage; .to() may fail if mixed placement.
-            pass
-
-        # Enable FlashVDM
-        if self.enable_flashvdm:
-            logger.info("Enabling FlashVDM acceleration...")
-            self.shape_pipeline.enable_flashvdm(
-                enabled=True,
-                adaptive_kv_selection=self.flashvdm_adaptive_kv,
-                topk_mode=self.flashvdm_topk_mode,
-                mc_algo=self.mc_algo,
-                replace_vae=True,
+        if pipeline is None:
+            raise RuntimeError(
+                "Hunyuan3DDiTFlowMatchingPipeline.from_pretrained() returned "
+                "None. Check that the model weights are correctly downloaded "
+                f"to {self.model_path}/{self.subfolder}."
             )
+
+        # Move pipeline to the target device.  Some diffusers-style
+        # pipelines return self from .to(), but others may return None
+        # (e.g. when sub-modules are already on the device via
+        # low_cpu_mem_usage).  Guard against None to avoid losing the
+        # reference.
+        try:
+            moved = pipeline.to(self.device)
+            if moved is not None:
+                pipeline = moved
+            else:
+                logger.warning(
+                    "pipeline.to(device) returned None; keeping original "
+                    "pipeline reference (model may already be on device)"
+                )
+        except Exception as e:
+            logger.warning(f"pipeline.to(device) failed: {e}. "
+                           "Model may already be on the target device.")
+
+        self.shape_pipeline = pipeline
+
+        # Enable FlashVDM — only if the method exists on this pipeline
+        # version.  Older or minimal installs may not ship FlashVDM.
+        if self.enable_flashvdm:
+            if hasattr(self.shape_pipeline, "enable_flashvdm"):
+                logger.info("Enabling FlashVDM acceleration...")
+                self.shape_pipeline.enable_flashvdm(
+                    enabled=True,
+                    adaptive_kv_selection=self.flashvdm_adaptive_kv,
+                    topk_mode=self.flashvdm_topk_mode,
+                    mc_algo=self.mc_algo,
+                    replace_vae=True,
+                )
+            else:
+                logger.warning(
+                    "FlashVDM requested but shape_pipeline has no "
+                    "enable_flashvdm() method. Continuing without "
+                    "FlashVDM acceleration (mesh generation will be slower)."
+                )
 
         # Load texture pipeline (optional — skipped in low_vram_mode unless
         # explicitly requested)

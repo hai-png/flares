@@ -207,7 +207,12 @@ class WildDet3DEstimator:
 
             with torch.no_grad():
                 try:
-                    results = self.model(
+                    # Build forward kwargs — only include parameters that
+                    # WildDet3DPredictor.forward() actually accepts. The
+                    # use_predicted_intrinsics flag controls whether we pass
+                    # predicted vs. default intrinsics at the *data* level,
+                    # not inside forward().
+                    forward_kwargs = dict(
                         images=data["images"].to(self.device),
                         intrinsics=data["intrinsics"].to(self.device)[None],
                         input_hw=[data["input_hw"]],
@@ -215,13 +220,27 @@ class WildDet3DEstimator:
                         padding=[data["padding"]],
                         input_boxes=[[x1, y1, x2, y2]],
                         prompt_text=prompt_text,
-                        use_predicted_intrinsics=self.use_predicted_intrinsics,
                     )
 
-                    if self.use_predicted_intrinsics:
-                        boxes, boxes3d, scores, scores_2d, scores_3d, class_ids, depth_maps = results[:7]
+                    # Some WildDet3D versions accept use_predicted_intrinsics
+                    # in forward(); probe the signature and include it only
+                    # when the parameter exists.
+                    import inspect
+                    sig = inspect.signature(self.model.forward)
+                    if "use_predicted_intrinsics" in sig.parameters:
+                        forward_kwargs["use_predicted_intrinsics"] = (
+                            self.use_predicted_intrinsics
+                        )
                     else:
-                        boxes, boxes3d, scores, scores_2d, scores_3d, class_ids, depth_maps = results[:7]
+                        logger.debug(
+                            "WildDet3D forward() does not accept "
+                            "use_predicted_intrinsics; using data-level "
+                            "intrinsics instead"
+                        )
+
+                    results = self.model(**forward_kwargs)
+
+                    boxes, boxes3d, scores, scores_2d, scores_3d, class_ids, depth_maps = results[:7]
 
                     # Extract 3D box for this object
                     if len(boxes3d) > 0 and len(boxes3d[0]) > 0:
