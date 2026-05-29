@@ -77,6 +77,31 @@ class SceneReconstructionResult:
         return scene
 
     def export_scene(self, path: str):
-        """Export the combined scene to file."""
+        """Export the combined scene to file.
+
+        If the scene has no objects, writes a placeholder file and logs
+        a warning instead of raising ValueError.
+        """
+        if not self.objects:
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.warning(
+                "No reconstructed objects to export — writing placeholder scene. "
+                "This usually means earlier pipeline stages failed to produce meshes."
+            )
+            # Create a minimal empty GLB so downstream tools don't crash
+            empty_scene = trimesh.Scene()
+            try:
+                empty_scene.export(path)
+            except ValueError:
+                # trimesh refuses to export truly empty scenes; write a
+                # 1-vertex placeholder mesh instead.
+                placeholder = trimesh.Trimesh(
+                    vertices=[[0, 0, 0]],
+                    faces=[[0, 0, 0]],
+                )
+                placeholder.export(path)
+            return
+
         scene = self.get_scene_mesh()
         scene.export(path)

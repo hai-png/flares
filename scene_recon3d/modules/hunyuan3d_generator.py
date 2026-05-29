@@ -515,7 +515,7 @@ class Hunyuan3DGenerator:
         logger.info(f"Generating 3D mesh (steps={steps}, guidance={gs}, resolution={res})...")
 
         with torch.no_grad():
-            mesh = self.shape_pipeline(
+            outputs = self.shape_pipeline(
                 image=image,
                 num_inference_steps=steps,
                 guidance_scale=gs,
@@ -523,16 +523,77 @@ class Hunyuan3DGenerator:
                 num_chunks=8000,
                 box_v=1.01,
                 output_type="trimesh",
-            )[0]
+            )
 
-        # Post-process: remove floaters and degenerate faces
+        # The shape pipeline returns a list.  With mc_algo="mc" the first
+        # element may already be a trimesh.Trimesh, or it may be a PLY-
+        # format bytes / string that needs explicit loading.
+        mesh = outputs[0]
+        if not isinstance(mesh, trimesh.Trimesh):
+            # Try to convert from PLY bytes / string / dict
+            try:
+                if isinstance(mesh, (bytes, bytearray)):
+                    mesh = trimesh.load(
+                        trimesh.util.wrap_as_stream(mesh),
+                        file_type="ply",
+                    )
+                elif isinstance(mesh, str):
+                    mesh = trimesh.load(
+                        trimesh.util.wrap_as_stream(mesh.encode()),
+                        file_type="ply",
+                    )
+                elif isinstance(mesh, dict):
+                    # Some pipeline versions return {vertices, faces} dicts
+                    mesh = trimesh.Trimesh(
+                        vertices=mesh.get("vertices"),
+                        faces=mesh.get("faces"),
+                    )
+            except Exception as e:
+                logger.warning(
+                    f"Could not convert pipeline output to trimesh: {e}. "
+                    "Attempting generic load..."
+                )
+                try:
+                    mesh = trimesh.load(mesh)
+                except Exception:
+                    raise RuntimeError(
+                        f"Shape pipeline returned unexpected type "
+                        f"{type(mesh).__name__}; cannot convert to trimesh"
+                    ) from e
+
+            # After loading, we may get a Scene instead of Trimesh
+            if isinstance(mesh, trimesh.Scene):
+                mesh = mesh.to_mesh()
+
+        # Post-process: remove floaters and degenerate faces.
+        # These tools depend on pymeshlab which may not be fully functional
+        # (e.g. missing libOpenGL, PLY loader issues).  Wrap each step
+        # individually so one failure doesn't block the rest.
+        post_steps = []
         try:
-            from hy3dshape import FaceReducer, FloaterRemover, DegenerateFaceRemover
-            mesh = FloaterRemover()(mesh)
-            mesh = DegenerateFaceRemover()(mesh)
-            mesh = FaceReducer()(mesh, max_facenum=10000)
+            from hy3dshape import FloaterRemover
+            post_steps.append(("FloaterRemover", FloaterRemover()))
         except ImportError:
-            logger.debug("Post-processing tools not available; skipping")
+            pass
+        try:
+            from hy3dshape import DegenerateFaceRemover
+            post_steps.append(("DegenerateFaceRemover", DegenerateFaceRemover()))
+        except ImportError:
+            pass
+        try:
+            from hy3dshape import FaceReducer
+            post_steps.append(("FaceReducer", FaceReducer()))
+        except ImportError:
+            pass
+
+        for name, processor in post_steps:
+            try:
+                if name == "FaceReducer":
+                    mesh = processor(mesh, max_facenum=10000)
+                else:
+                    mesh = processor(mesh)
+            except Exception as e:
+                logger.debug(f"Post-processing {name} failed: {e}; skipping")
 
         # Apply texture if paint pipeline is available
         if self.paint_pipeline is not None and output_path:
