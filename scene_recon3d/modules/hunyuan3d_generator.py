@@ -111,9 +111,9 @@ class Hunyuan3DGenerator:
         - ./hy3dpaint must be on sys.path for `from textureGenPipeline import ...`
         The hy3dshape dir contains a nested package: hy3dshape/hy3dshape/
         """
-        # Module is at flares/scene_recon3d/modules/ → need 3 levels up to flares/
+        # Module is at flares/scene_recon3d/modules/ → 2 levels up to flares/
         repo_path = os.path.join(
-            os.path.dirname(__file__), "..", "..", "..", "repos", "Hunyuan3D-2.1"
+            os.path.dirname(__file__), "..", "..", "repos", "Hunyuan3D-2.1"
         )
         repo_path = os.path.abspath(repo_path)
 
@@ -248,7 +248,7 @@ class Hunyuan3DGenerator:
 
                 # Find config and checkpoint paths
                 repo_base = os.path.join(
-                    os.path.dirname(__file__), "..", "..", "..", "repos", "Hunyuan3D-2.1"
+                    os.path.dirname(__file__), "..", "..", "repos", "Hunyuan3D-2.1"
                 )
                 realesrgan_path = self.realesrgan_ckpt
                 if not os.path.isabs(realesrgan_path):

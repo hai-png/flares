@@ -72,8 +72,9 @@ class WildDet3DEstimator:
         that auto-adds third_party submodules to sys.path on import.
         We also add third_party dirs manually as a fallback.
         """
+        # Module is at flares/scene_recon3d/modules/ → 2 levels up to flares/
         repo_path = os.path.join(
-            os.path.dirname(__file__), "..", "..", "..", "repos", "WildDet3D"
+            os.path.dirname(__file__), "..", "..", "repos", "WildDet3D"
         )
         repo_path = os.path.abspath(repo_path)
 

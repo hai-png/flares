@@ -82,8 +82,9 @@ class MARCORefiner:
         a local checkpoint file.
         """
         # Add MARCO repo to path if needed
+        # Module is at flares/scene_recon3d/modules/ → 2 levels up to flares/
         repo_path = os.path.join(
-            os.path.dirname(__file__), "..", "..", "..", "repos", "MARCO"
+            os.path.dirname(__file__), "..", "..", "repos", "MARCO"
         )
         if os.path.exists(repo_path) and repo_path not in sys.path:
             sys.path.insert(0, repo_path)
