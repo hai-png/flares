@@ -90,16 +90,29 @@ def align_mesh_to_bbox(
 ) -> Tuple[trimesh.Trimesh, float, np.ndarray, np.ndarray]:
     """Align a canonically-posed mesh to a 3D bounding box.
 
-    The generated mesh from Hunyuan3D is in a canonical pose centered at origin.
-    We need to:
-    1. Compute scale factor so the mesh fits within the 3D bounding box dimensions
-    2. Apply the bounding box rotation
-    3. Translate to the bounding box center
+    The generated mesh from Hunyuan3D is in a canonical pose centered at origin
+    in Y-up convention (X-right, Y-up, Z-toward-viewer).
+
+    WildDet3D outputs bounding boxes in OpenCV camera coordinates (X-right,
+    Y-down, Z-forward) with dimensions (W, L, H) where:
+      - W (width)  → Z-axis (forward/backward)
+      - L (length) → X-axis (left/right)
+      - H (height) → Y-axis (down/up, vertical)
+
+    This is NOT a simple (X, Y, Z) mapping!  The scale computation must
+    remap bbox dimensions to match the mesh's local axes before dividing.
+
+    Steps:
+    1. Remap bbox dims: (W, L, H) → (L, H, W) to match (mesh_X, mesh_Y, mesh_Z)
+    2. Compute uniform scale factor from remapped ratios
+    3. Convert quaternion to rotation matrix
+    4. Apply axis conversion (OpenCV Y-down → mesh Y-up)
+    5. Center, scale, rotate, and translate the mesh
 
     Args:
         mesh: The canonical trimesh.Trimesh object
         bbox_center: (3,) 3D center of the bounding box in meters
-        bbox_dims: (3,) (w, l, h) dimensions in meters
+        bbox_dims: (3,) (W, L, H) dimensions in meters from WildDet3D
         bbox_quat: (4,) (qw, qx, qy, qz) quaternion for rotation
         bbox_up_axis: Up axis convention of the 3D bbox ("y" for WildDet3D/OpenCV)
 
@@ -108,31 +121,52 @@ def align_mesh_to_bbox(
     """
     # Get mesh bounding box
     mesh_bounds = mesh.bounds  # (2, 3) min and max
-    mesh_extents = mesh.extents  # (3,) size along each axis
+    mesh_extents = mesh.extents  # (3,) size along each axis in Y-up frame
     mesh_center = mesh.bounds.mean(axis=0)
 
-    # Compute scale: map mesh extents to bbox dims
-    # We want the mesh to fit within the bbox, so we scale by the
-    # ratio of bbox dims to mesh extents
-    # Handle case where mesh has near-zero extent on some axis
+    # ── Remap bbox dimensions to match mesh axes ──────────────────
+    #
+    # WildDet3D bbox_dims = (W, L, H) where:
+    #   W → camera Z (forward)  ↔  mesh Z (depth/front)
+    #   L → camera X (right)    ↔  mesh X (width)
+    #   H → camera Y (down)     ↔  mesh -Y (up)  [sign doesn't affect scale]
+    #
+    # So to compare with mesh_extents = (X, Y, Z):
+    #   mesh X ↔ L = bbox_dims[1]
+    #   mesh Y ↔ H = bbox_dims[2]
+    #   mesh Z ↔ W = bbox_dims[0]
+    W, L, H = bbox_dims[0], bbox_dims[1], bbox_dims[2]
+    bbox_dims_remapped = np.array([L, H, W], dtype=np.float64)
+
+    # Compute uniform scale: map mesh extents to bbox dims (remapped)
     mesh_extents_safe = np.maximum(mesh_extents, 1e-6)
-    scale_ratios = bbox_dims / mesh_extents_safe
-    # Use the minimum scale ratio to ensure the mesh fits inside the bbox
-    # But also consider that different axes may map differently
+    scale_ratios = bbox_dims_remapped / mesh_extents_safe
+    # Use minimum ratio so the mesh fits inside the bbox on all axes
     scale_factor = float(np.min(scale_ratios))
 
-    # Get rotation from quaternion
+    logger.info(
+        f"  Scale computation: mesh_extents={mesh_extents}, "
+        f"bbox_dims=(W={W:.3f}, L={L:.3f}, H={H:.3f}), "
+        f"remapped=(L={L:.3f}, H={H:.3f}, W={W:.3f}), "
+        f"ratios={scale_ratios}, scale={scale_factor:.4f}"
+    )
+
+    # ── Rotation from quaternion ──────────────────────────────────
     R = quaternion_to_rotation_matrix(bbox_quat)
 
-    # Handle up-axis convention differences between the 3D bbox system
-    # and the mesh generation system.
-    # WildDet3D uses OpenCV convention (Y-down, Z-forward).
+    # ── Axis convention conversion ────────────────────────────────
+    # WildDet3D uses OpenCV (Y-down, Z-forward).
     # Hunyuan3D generates meshes in Y-up convention.
-    # If the bbox up-axis is "y" (OpenCV), we need to flip Y and Z
-    # to match the mesh's Y-up convention before applying the quaternion rotation.
+    # The quaternion rotates the box in camera coordinates.
+    # We need to convert the mesh from Y-up to camera Y-down BEFORE
+    # applying the quaternion rotation.
+    #
+    # The conversion: (x, y, z)_mesh → (x, -y, -z)_camera
+    # This is a 180° rotation around X: diag(1, -1, -1)
+    #
+    # Combined rotation: R_final = R_quat @ axis_conversion
+    # Effect: first convert mesh to camera frame, then rotate by quaternion
     if bbox_up_axis == "y":
-        # OpenCV: Y-down → rotate 180° around X axis to get Y-up
-        # This flips both Y and Z axes: [x, -y, -z]
         axis_conversion = np.array([
             [1,  0,  0],
             [0, -1,  0],
@@ -140,7 +174,7 @@ def align_mesh_to_bbox(
         ], dtype=np.float64)
         R = R @ axis_conversion
 
-    # Build the full transformation:
+    # ── Build the full transformation ─────────────────────────────
     # 1. Center the mesh at origin
     # 2. Scale it
     # 3. Rotate it
@@ -162,6 +196,119 @@ def align_mesh_to_bbox(
     centered_mesh.apply_translation(bbox_center)
 
     return centered_mesh, scale_factor, R, bbox_center
+
+
+def bbox3d_to_corners_opencv(
+    bbox_center: np.ndarray,
+    bbox_dims: np.ndarray,
+    bbox_quat: np.ndarray,
+) -> np.ndarray:
+    """Compute 8 corners of a 3D bounding box in camera coordinates.
+
+    WildDet3D convention (OpenCV): bbox_dims = (W, L, H) where
+      W → Z-axis, L → X-axis, H → Y-axis.
+
+    Args:
+        bbox_center: (3,) 3D center in camera coords
+        bbox_dims: (3,) (W, L, H) dimensions
+        bbox_quat: (4,) (qw, qx, qy, qz) quaternion
+
+    Returns:
+        (8, 3) array of corner positions in camera coordinates
+    """
+    W, L, H = bbox_dims[0], bbox_dims[1], bbox_dims[2]
+
+    # Corners in the box's local frame (before rotation)
+    # X: ±L/2, Y: ±H/2, Z: ±W/2  (WildDet3D convention)
+    x_corners = np.array([L/2, L/2, -L/2, -L/2, L/2, L/2, -L/2, -L/2])
+    y_corners = np.array([H/2, H/2, H/2, H/2, -H/2, -H/2, -H/2, -H/2])
+    z_corners = np.array([W/2, -W/2, -W/2, W/2, W/2, -W/2, -W/2, W/2])
+
+    corners = np.stack([x_corners, y_corners, z_corners], axis=1)  # (8, 3)
+
+    # Apply rotation
+    R = quaternion_to_rotation_matrix(bbox_quat)
+    corners = (R @ corners.T).T
+
+    # Apply translation
+    corners += bbox_center
+
+    return corners
+
+
+def project_points_to_2d(
+    points_3d: np.ndarray,
+    camera_intrinsics: np.ndarray,
+) -> np.ndarray:
+    """Project 3D points to 2D image coordinates.
+
+    Args:
+        points_3d: (N, 3) 3D points in camera coordinates
+        camera_intrinsics: (3, 3) camera intrinsic matrix
+
+    Returns:
+        (N, 2) 2D pixel coordinates (u, v)
+    """
+    fx = camera_intrinsics[0, 0]
+    fy = camera_intrinsics[1, 1]
+    cx = camera_intrinsics[0, 2]
+    cy = camera_intrinsics[1, 2]
+
+    # Project: u = fx * X/Z + cx, v = fy * Y/Z + cy
+    z = points_3d[:, 2]
+    z_safe = np.where(np.abs(z) > 1e-6, z, 1e-6)
+
+    u = fx * points_3d[:, 0] / z_safe + cx
+    v = fy * points_3d[:, 1] / z_safe + cy
+
+    return np.stack([u, v], axis=1)
+
+
+def draw_bbox3d_on_image(
+    image: np.ndarray,
+    bbox_center: np.ndarray,
+    bbox_dims: np.ndarray,
+    bbox_quat: np.ndarray,
+    camera_intrinsics: np.ndarray,
+    color: Tuple[int, int, int] = (0, 255, 0),
+    thickness: int = 2,
+) -> np.ndarray:
+    """Draw a 3D bounding box projected onto a 2D image.
+
+    Args:
+        image: (H, W, 3) uint8 RGB image
+        bbox_center: (3,) 3D center in camera coords
+        bbox_dims: (3,) (W, L, H) dimensions
+        bbox_quat: (4,) (qw, qx, qy, qz) quaternion
+        camera_intrinsics: (3, 3) camera intrinsic matrix
+        color: RGB color for the box edges
+        thickness: Line thickness
+
+    Returns:
+        Image with 3D bounding box drawn
+    """
+    corners_3d = bbox3d_to_corners_opencv(bbox_center, bbox_dims, bbox_quat)
+    corners_2d = project_points_to_2d(corners_3d, camera_intrinsics)
+
+    # Draw edges connecting the 8 corners
+    # Bottom face: 0-1-2-3-0, Top face: 4-5-6-7-4, Verticals: 0-4, 1-5, 2-6, 3-7
+    edges = [
+        (0, 1), (1, 2), (2, 3), (3, 0),  # bottom
+        (4, 5), (5, 6), (6, 7), (7, 4),  # top
+        (0, 4), (1, 5), (2, 6), (3, 7),  # verticals
+    ]
+
+    vis = image.copy()
+    h, w = vis.shape[:2]
+    for i, j in edges:
+        pt1 = corners_2d[i].astype(int)
+        pt2 = corners_2d[j].astype(int)
+        # Only draw if both points are reasonably within image bounds
+        if (0 <= pt1[0] < w and 0 <= pt1[1] < h and
+            0 <= pt2[0] < w and 0 <= pt2[1] < h):
+            cv2.line(vis, tuple(pt1), tuple(pt2), color, thickness)
+
+    return vis
 
 
 # ─── Pose Refinement with Correspondences ────────────────────────

@@ -29,7 +29,7 @@ from .modules.wilddet3d_estimator import WildDet3DEstimator
 from .modules.hunyuan3d_generator import Hunyuan3DGenerator
 from .modules.marco_refiner import MARCORefiner
 from .utils.data_types import DetectedObject, ObjectReconstructionResult, SceneReconstructionResult
-from .utils.geometry import align_mesh_to_bbox, crop_image_with_mask
+from .utils.geometry import align_mesh_to_bbox, crop_image_with_mask, draw_bbox3d_on_image
 
 logger = logging.getLogger(__name__)
 
@@ -444,6 +444,17 @@ class SceneReconstructionPipeline:
             import cv2
             cv2.imwrite(os.path.join(output_dir, "1_detections.png"), cv2.cvtColor(vis, cv2.COLOR_RGB2BGR))
 
+            # Save per-object crop images
+            crops_dir = os.path.join(output_dir, "crops")
+            os.makedirs(crops_dir, exist_ok=True)
+            for obj in objects:
+                if obj.crop_image is not None:
+                    crop_path = os.path.join(crops_dir, f"{obj.class_name}_{obj.object_id}_crop.png")
+                    cv2.imwrite(crop_path, cv2.cvtColor(obj.crop_image, cv2.COLOR_RGB2BGR))
+                if obj.crop_mask is not None:
+                    mask_path = os.path.join(crops_dir, f"{obj.class_name}_{obj.object_id}_mask.png")
+                    cv2.imwrite(mask_path, (obj.crop_mask * 255).astype(np.uint8))
+
         # Free RF-DETR from GPU before loading WildDet3D (low VRAM mode)
         if self.low_vram_mode:
             self._unload_model("detector")
@@ -471,6 +482,58 @@ class SceneReconstructionPipeline:
         # Hunyuan3D is the heaviest model (~7-10GB VRAM) and needs the space
         if self.low_vram_mode:
             self._unload_model("estimator_3d")
+
+        # Save 3D bbox visualization and data
+        if self.save_intermediate:
+            import cv2
+            import json
+
+            # Draw 3D bounding boxes projected to 2D
+            if camera_intrinsics is not None:
+                vis_3d = image.copy()
+                colors = [(0, 255, 0), (255, 0, 0), (0, 0, 255), (255, 255, 0)]
+                for i, obj in enumerate(objects):
+                    if obj.bbox_3d is not None:
+                        color = colors[i % len(colors)]
+                        vis_3d = draw_bbox3d_on_image(
+                            vis_3d,
+                            obj.bbox_3d_center,
+                            obj.bbox_3d_dims,
+                            obj.bbox_3d_quat,
+                            camera_intrinsics,
+                            color=color,
+                            thickness=2,
+                        )
+                        # Add label
+                        corners_3d = obj.bbox_3d_center.reshape(1, 3)
+                        from .utils.geometry import project_points_to_2d
+                        center_2d = project_points_to_2d(corners_3d, camera_intrinsics)[0]
+                        label = f"{obj.class_name} (3D: {obj.score_3d:.2f})"
+                        cv2.putText(vis_3d, label,
+                                    (int(center_2d[0]) - 40, int(center_2d[1]) - 10),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+                cv2.imwrite(os.path.join(output_dir, "2_bbox3d_projection.png"),
+                            cv2.cvtColor(vis_3d, cv2.COLOR_RGB2BGR))
+
+            # Save 3D bbox data as JSON
+            bbox_data = []
+            for obj in objects:
+                if obj.bbox_3d is not None:
+                    bbox_data.append({
+                        "object_id": obj.object_id,
+                        "class_name": obj.class_name,
+                        "bbox_3d_center": obj.bbox_3d_center.tolist(),
+                        "bbox_3d_dims_WLH": obj.bbox_3d_dims.tolist(),
+                        "bbox_3d_quat_wxyz": obj.bbox_3d_quat.tolist(),
+                        "score_3d": float(obj.score_3d) if obj.score_3d is not None else None,
+                        "bbox_2d_xyxy": obj.bbox_2d.tolist(),
+                    })
+            with open(os.path.join(output_dir, "2_bbox3d_data.json"), "w") as f:
+                json.dump(bbox_data, f, indent=2)
+
+            # Save intrinsics
+            if camera_intrinsics is not None:
+                np.save(os.path.join(output_dir, "camera_intrinsics.npy"), camera_intrinsics)
 
         # ═══════════════════════════════════════════════════════════
         # Stage 3: Hunyuan3D — Per-Object 3D Mesh Generation
@@ -532,19 +595,130 @@ class SceneReconstructionPipeline:
                 f"Object {obj.object_id} ({obj.class_name}): "
                 f"scale={scale_factor:.4f}, "
                 f"center={obj.bbox_3d_center}, "
-                f"dims={obj.bbox_3d_dims}"
+                f"dims(W,L,H)={obj.bbox_3d_dims}, "
+                f"quat(w,x,y,z)={obj.bbox_3d_quat}"
             )
 
         self._stats.stage_times["4_alignment"] = time.time() - t0
 
-        # Save aligned meshes
+        # Save aligned meshes and alignment debug data
         if self.save_intermediate:
+            import cv2
+            import json
+
             aligned_dir = os.path.join(output_dir, "aligned")
             os.makedirs(aligned_dir, exist_ok=True)
+            alignment_debug = []
             for obj in objects:
                 if obj.aligned_mesh is not None:
+                    # Save aligned mesh
                     path = os.path.join(aligned_dir, f"{obj.class_name}_{obj.object_id}.glb")
                     obj.aligned_mesh.export(path)
+
+                    # Collect debug info
+                    debug_info = {
+                        "object_id": obj.object_id,
+                        "class_name": obj.class_name,
+                        "scale_factor": obj.scale_factor,
+                        "initial_rotation": obj.initial_rotation.tolist() if obj.initial_rotation is not None else None,
+                        "initial_translation": obj.initial_translation.tolist() if obj.initial_translation is not None else None,
+                        "bbox_3d_center": obj.bbox_3d_center.tolist() if obj.bbox_3d_center is not None else None,
+                        "bbox_3d_dims_WLH": obj.bbox_3d_dims.tolist() if obj.bbox_3d_dims is not None else None,
+                        "bbox_3d_quat_wxyz": obj.bbox_3d_quat.tolist() if obj.bbox_3d_quat is not None else None,
+                        "aligned_mesh_extents": obj.aligned_mesh.extents.tolist(),
+                        "canonical_mesh_extents": obj.mesh.extents.tolist() if obj.mesh is not None else None,
+                    }
+                    alignment_debug.append(debug_info)
+
+                    # Validation: project aligned mesh bounding box back to 2D
+                    # and compare with original 2D detection
+                    if camera_intrinsics is not None and obj.bbox_2d is not None:
+                        from .utils.geometry import project_points_to_2d
+                        # Get the 8 corners of the aligned mesh's bounding box
+                        aligned_bounds = obj.aligned_mesh.bounds  # (2, 3) min, max
+                        mins, maxs = aligned_bounds
+                        corners = np.array([
+                            [mins[0], mins[1], mins[2]],
+                            [maxs[0], mins[1], mins[2]],
+                            [maxs[0], maxs[1], mins[2]],
+                            [mins[0], maxs[1], mins[2]],
+                            [mins[0], mins[1], maxs[2]],
+                            [maxs[0], mins[1], maxs[2]],
+                            [maxs[0], maxs[1], maxs[2]],
+                            [mins[0], maxs[1], maxs[2]],
+                        ])
+                        corners_2d = project_points_to_2d(corners, camera_intrinsics)
+                        proj_x1 = corners_2d[:, 0].min()
+                        proj_y1 = corners_2d[:, 1].min()
+                        proj_x2 = corners_2d[:, 0].max()
+                        proj_y2 = corners_2d[:, 1].max()
+
+                        det_x1, det_y1, det_x2, det_y2 = obj.bbox_2d.tolist()
+
+                        # Compute IoU between projected and detected 2D boxes
+                        ix1 = max(proj_x1, det_x1)
+                        iy1 = max(proj_y1, det_y1)
+                        ix2 = min(proj_x2, det_x2)
+                        iy2 = min(proj_y2, det_y2)
+                        inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+                        area_proj = (proj_x2 - proj_x1) * (proj_y2 - proj_y1)
+                        area_det = (det_x2 - det_x1) * (det_y2 - det_y1)
+                        iou = inter / max(area_proj + area_det - inter, 1e-6)
+
+                        debug_info["reprojection_2d"] = {
+                            "projected_bbox_xyxy": [proj_x1, proj_y1, proj_x2, proj_y2],
+                            "detected_bbox_xyxy": [det_x1, det_y1, det_x2, det_y2],
+                            "iou": float(iou),
+                        }
+
+                        if iou < 0.3:
+                            logger.warning(
+                                f"Object {obj.object_id} alignment has low 2D IoU={iou:.3f}. "
+                                f"Projected [{proj_x1:.0f},{proj_y1:.0f},{proj_x2:.0f},{proj_y2:.0f}] "
+                                f"vs detected [{det_x1:.0f},{det_y1:.0f},{det_x2:.0f},{det_y2:.0f}]. "
+                                f"Alignment may be inaccurate."
+                            )
+
+            # Save alignment debug data
+            with open(os.path.join(output_dir, "4_alignment_debug.json"), "w") as f:
+                json.dump(alignment_debug, f, indent=2)
+
+            # Draw alignment validation visualization
+            if camera_intrinsics is not None:
+                vis_align = image.copy()
+                for i, obj in enumerate(objects):
+                    if obj.aligned_mesh is not None and obj.bbox_2d is not None:
+                        from .utils.geometry import project_points_to_2d
+                        # Draw detected 2D bbox (green)
+                        x1, y1, x2, y2 = obj.bbox_2d.astype(int)
+                        cv2.rectangle(vis_align, (x1, y1), (x2, y2), (0, 255, 0), 2)
+
+                        # Draw projected aligned mesh bbox (red)
+                        aligned_bounds = obj.aligned_mesh.bounds
+                        mins, maxs = aligned_bounds
+                        corners = np.array([
+                            [mins[0], mins[1], mins[2]],
+                            [maxs[0], mins[1], mins[2]],
+                            [maxs[0], maxs[1], mins[2]],
+                            [mins[0], maxs[1], mins[2]],
+                            [mins[0], mins[1], maxs[2]],
+                            [maxs[0], mins[1], maxs[2]],
+                            [maxs[0], maxs[1], maxs[2]],
+                            [mins[0], maxs[1], maxs[2]],
+                        ])
+                        corners_2d = project_points_to_2d(corners, camera_intrinsics).astype(int)
+                        px1, py1 = corners_2d[:, 0].min(), corners_2d[:, 1].min()
+                        px2, py2 = corners_2d[:, 0].max(), corners_2d[:, 1].max()
+                        cv2.rectangle(vis_align, (px1, py1), (px2, py2), (255, 0, 0), 2)
+
+                        # Label
+                        iou_val = 0.0
+                        if hasattr(obj, '_align_iou'):
+                            iou_val = obj._align_iou
+                        cv2.putText(vis_align, f"{obj.class_name} IoU={iou_val:.2f}",
+                                    (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
+                cv2.imwrite(os.path.join(output_dir, "4_alignment_validation.png"),
+                            cv2.cvtColor(vis_align, cv2.COLOR_RGB2BGR))
 
         # ═══════════════════════════════════════════════════════════
         # Stage 5: MARCO — Pose Refinement via Semantic Correspondence
@@ -571,6 +745,47 @@ class SceneReconstructionPipeline:
         self._stats.num_objects_refined = sum(
             1 for o in objects if o.refined_rotation is not None
         )
+
+        # Save refined meshes and MARCO debug data
+        if self.save_intermediate:
+            import json
+
+            refined_dir = os.path.join(output_dir, "refined")
+            os.makedirs(refined_dir, exist_ok=True)
+            marco_debug = []
+            for obj in objects:
+                if obj.refined_rotation is not None:
+                    # Save refined mesh (apply refined transform to canonical mesh)
+                    refined_mesh = obj.mesh.copy()
+                    mesh_center = refined_mesh.bounds.mean(axis=0)
+                    refined_mesh.apply_translation(-mesh_center)
+                    scale_factor = obj.scale_factor if obj.scale_factor is not None else 1.0
+                    refined_mesh.apply_scale(scale_factor)
+                    T_rot = np.eye(4)
+                    T_rot[:3, :3] = obj.refined_rotation
+                    refined_mesh.apply_transform(T_rot)
+                    refined_mesh.apply_translation(obj.refined_translation)
+                    path = os.path.join(refined_dir, f"{obj.class_name}_{obj.object_id}_refined.glb")
+                    refined_mesh.export(path)
+
+                    debug_info = {
+                        "object_id": obj.object_id,
+                        "class_name": obj.class_name,
+                        "refined_rotation": obj.refined_rotation.tolist(),
+                        "refined_translation": obj.refined_translation.tolist(),
+                        "initial_rotation": obj.initial_rotation.tolist() if obj.initial_rotation is not None else None,
+                        "initial_translation": obj.initial_translation.tolist() if obj.initial_translation is not None else None,
+                        "rotation_diff_norm": float(np.linalg.norm(
+                            obj.refined_rotation - (obj.initial_rotation if obj.initial_rotation is not None else np.eye(3))
+                        )),
+                        "translation_diff_norm": float(np.linalg.norm(
+                            obj.refined_translation - (obj.initial_translation if obj.initial_translation is not None else np.zeros(3))
+                        )),
+                    }
+                    marco_debug.append(debug_info)
+
+            with open(os.path.join(output_dir, "5_marco_debug.json"), "w") as f:
+                json.dump(marco_debug, f, indent=2)
 
         # ═══════════════════════════════════════════════════════════
         # Build Final Result
@@ -643,6 +858,39 @@ class SceneReconstructionPipeline:
         scene_path = os.path.join(output_dir, "scene.glb")
         result.export_scene(scene_path)
         logger.info(f"Final scene exported to {scene_path}")
+
+        # Also export individual object meshes (with transform baked in)
+        if self.save_intermediate:
+            final_dir = os.path.join(output_dir, "final_objects")
+            os.makedirs(final_dir, exist_ok=True)
+            for result_obj in result_objects:
+                mesh = result_obj.mesh.copy()
+                mesh.apply_transform(result_obj.transform)
+                obj_path = os.path.join(final_dir, f"{result_obj.class_name}_{result_obj.object_id}.glb")
+                mesh.export(obj_path)
+
+        # Save pipeline summary
+        if self.save_intermediate:
+            import json
+            summary = {
+                "image_shape": [h, w],
+                "num_objects_detected": self._stats.num_objects_detected,
+                "num_objects_3d": self._stats.num_objects_3d,
+                "num_objects_meshed": self._stats.num_objects_meshed,
+                "num_objects_refined": self._stats.num_objects_refined,
+                "total_time_s": self._stats.total_time if self._stats.total_time > 0 else time.time() - start_time,
+                "stage_times_s": self._stats.stage_times,
+                "objects": [
+                    {
+                        "object_id": o.object_id,
+                        "class_name": o.class_name,
+                        "confidence": o.confidence,
+                    }
+                    for o in result_objects
+                ],
+            }
+            with open(os.path.join(output_dir, "pipeline_summary.json"), "w") as f:
+                json.dump(summary, f, indent=2)
 
         self._stats.total_time = time.time() - start_time
         self._log_stats()
