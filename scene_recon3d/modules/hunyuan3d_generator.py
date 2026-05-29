@@ -350,22 +350,30 @@ class Hunyuan3DGenerator:
         # Load background remover (optional — the pipeline already produces
         # RGBA images with transparent backgrounds from segmentation masks,
         # so rembg is only needed for images that lack an alpha channel.)
+        #
+        # IMPORTANT: rembg depends on onnxruntime.  When onnxruntime is not
+        # installed, rembg's __init__.py prints a warning and calls
+        # sys.exit(1), which kills the entire process.  We must check for
+        # onnxruntime *before* importing anything that depends on rembg.
+        self.rembg = None
         try:
-            from hy3dshape.rembg import BackgroundRemover
-            self.rembg = BackgroundRemover()
-        except Exception as e:
-            # Catch *all* exceptions, not just ImportError:
-            # - ImportError: rembg package not installed
-            # - OSError / RuntimeError: onnxruntime missing or incompatible
-            #   (onnxruntime-gpu requires numpy>=2.3 which breaks pymeshlab)
+            import onnxruntime  # noqa: F401
+        except ImportError:
             logger.info(
-                "BackgroundRemover not available "
-                f"({type(e).__name__}: {e}). "
+                "onnxruntime not installed — BackgroundRemover disabled. "
                 "Pipeline will use segmentation masks for background removal "
-                "instead of rembg. If you want rembg, install onnxruntime "
-                "(CPU): pip install onnxruntime"
+                "instead. To enable rembg: pip install onnxruntime"
             )
-            self.rembg = None
+        else:
+            try:
+                from hy3dshape.rembg import BackgroundRemover
+                self.rembg = BackgroundRemover()
+            except (ImportError, OSError, RuntimeError) as e:
+                logger.info(
+                    f"BackgroundRemover not available ({type(e).__name__}: {e}). "
+                    "Pipeline will use segmentation masks instead."
+                )
+                self.rembg = None
 
         # After loading, reclaim any temporary CPU memory from deserialization
         import gc
