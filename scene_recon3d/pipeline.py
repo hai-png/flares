@@ -558,7 +558,8 @@ class SceneReconstructionPipeline:
 
         if camera_intrinsics is not None:
             objects = self.refiner.refine_poses(
-                objects, camera_intrinsics, render_resolution=self.render_resolution
+                objects, camera_intrinsics, render_resolution=self.render_resolution,
+                original_image_shape=(h, w),
             )
         else:
             logger.warning(
@@ -578,10 +579,12 @@ class SceneReconstructionPipeline:
             if obj.aligned_mesh is None:
                 continue
 
-            # Use the final mesh (refined if available, else aligned)
-            final_mesh = obj.aligned_mesh
-
-            # Build the final transform
+            # Build the final transform from the canonical mesh to world/camera coords.
+            # The canonical mesh is centered at origin, so we need:
+            #   T = Translate(bbox_center) @ Rotate(R) @ Scale(scale_factor)
+            # The aligned_mesh already has this transform baked in.
+            # To avoid a double-transform when get_scene_mesh() applies
+            # obj.transform, we store the canonical mesh + the full transform.
             if obj.refined_rotation is not None:
                 R = obj.refined_rotation
                 t = obj.refined_translation
@@ -589,16 +592,42 @@ class SceneReconstructionPipeline:
                 R = obj.initial_rotation
                 t = obj.initial_translation
 
-            T = np.eye(4)
-            T[:3, :3] = R
-            T[:3, 3] = t
+            scale_factor = obj.scale_factor if obj.scale_factor is not None else 1.0
+
+            # Build the full homogeneous transform that maps the canonical
+            # (origin-centered) mesh to its final world position:
+            #   T = Translate(t) @ Rotate(R) @ Scale(s)
+            T_scale = np.eye(4)
+            T_scale[0, 0] = scale_factor
+            T_scale[1, 1] = scale_factor
+            T_scale[2, 2] = scale_factor
+
+            T_rot = np.eye(4)
+            T_rot[:3, :3] = R
+
+            T_trans = np.eye(4)
+            T_trans[:3, 3] = t
+
+            T = T_trans @ T_rot @ T_scale
+
+            # Use the canonical mesh (NOT aligned_mesh) so that
+            # get_scene_mesh() can apply the transform exactly once.
+            canonical_mesh = obj.mesh
+            if canonical_mesh is None:
+                continue
+
+            # Center the canonical mesh at origin (it should already be, but
+            # ensure consistency with align_mesh_to_bbox which does this)
+            centered = canonical_mesh.copy()
+            mesh_center = centered.bounds.mean(axis=0)
+            centered.apply_translation(-mesh_center)
 
             result_obj = ObjectReconstructionResult(
                 object_id=obj.object_id,
                 class_name=obj.class_name,
-                mesh=final_mesh,
+                mesh=centered,
                 transform=T,
-                bbox_3d=obj.bbox_3d if obj.bbox_3d is not None else np.zeros(10),
+                bbox_3d=obj.bbox_3d if obj.bbox_3d is not None else None,
                 confidence=obj.confidence,
             )
             result_objects.append(result_obj)

@@ -226,6 +226,7 @@ Examples:
     # Apply CLI overrides
     if args.rfdetr_variant:
         pipeline.detector.variant = args.rfdetr_variant
+        pipeline.detector.model = None  # Force reload with new variant
     if args.confidence is not None:
         pipeline.detector.confidence_threshold = args.confidence
     if args.no_flashvdm:

@@ -21,6 +21,7 @@ class DetectedObject:
     mask_2d: np.ndarray              # (H, W) boolean mask
     crop_image: Optional[np.ndarray] = None  # (H, W, 3) uint8 cropped+masked image
     crop_mask: Optional[np.ndarray] = None   # (H, W) boolean mask for the crop
+    crop_offset: Optional[Tuple[int, int]] = None  # (x1, y1) top-left of crop in original image
 
     # 3D bounding box (from WildDet3D)
     bbox_3d: Optional[np.ndarray] = None     # (10,) cx,cy,cz,w,l,h,qw,qx,qy,qz
@@ -53,8 +54,8 @@ class ObjectReconstructionResult:
     class_name: str
     mesh: trimesh.Trimesh
     transform: np.ndarray             # (4,4) homogeneous transform
-    bbox_3d: np.ndarray               # (10,) 3D bounding box params
-    confidence: float
+    bbox_3d: Optional[np.ndarray] = None  # (10,) 3D bounding box params, or None
+    confidence: float = 0.0
 
 
 @dataclass

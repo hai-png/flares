@@ -121,6 +121,22 @@ def align_mesh_to_bbox(
     # Get rotation from quaternion
     R = quaternion_to_rotation_matrix(bbox_quat)
 
+    # Handle up-axis convention differences between the 3D bbox system
+    # and the mesh generation system.
+    # WildDet3D uses OpenCV convention (Y-down, Z-forward).
+    # Hunyuan3D generates meshes in Y-up convention.
+    # If the bbox up-axis is "y" (OpenCV), we need to flip Y and Z
+    # to match the mesh's Y-up convention before applying the quaternion rotation.
+    if bbox_up_axis == "y":
+        # OpenCV: Y-down → rotate 180° around X axis to get Y-up
+        # This flips both Y and Z axes: [x, -y, -z]
+        axis_conversion = np.array([
+            [1,  0,  0],
+            [0, -1,  0],
+            [0,  0, -1],
+        ], dtype=np.float64)
+        R = R @ axis_conversion
+
     # Build the full transformation:
     # 1. Center the mesh at origin
     # 2. Scale it
@@ -179,18 +195,20 @@ def refine_pose_with_correspondences(
         # Not enough correspondences for PnP; return current pose
         return current_rotation, current_translation
 
-    # Scale 3D points by the same scale factor used in alignment
+    # Scale 3D points by the same scale factor used in alignment.
+    # These points are in the object's local coordinate frame (centered at origin).
     src_points_3d_scaled = src_points_3d * scale_factor
 
-    # Apply current rotation to get 3D points in world (camera) frame
-    src_points_3d_world = (current_rotation @ src_points_3d_scaled.T).T + current_translation
-
-    # Use solvePnP with the target 2D points (from rendered image)
-    # and the 3D mesh points
+    # solvePnP expects 3D points in the OBJECT's local coordinate frame and
+    # 2D points in the image. It returns (rvec, tvec) such that:
+    #   p_camera = R @ p_object + t
+    # Previously the code mistakenly transformed 3D points to world/camera
+    # frame before passing them, which makes solvePnP solve for an identity
+    # transform — rendering the refinement useless.
     dist_coeffs = np.zeros((4, 1))  # No distortion
 
     success, rvec, tvec = cv2.solvePnP(
-        src_points_3d_world,
+        src_points_3d_scaled.astype(np.float64),
         tgt_points_2d.astype(np.float64),
         camera_intrinsics.astype(np.float64),
         dist_coeffs,
@@ -261,16 +279,25 @@ def render_mesh(
     resolution: int = 512,
     camera_intrinsics: np.ndarray = None,
     camera_pose: np.ndarray = None,
+    original_image_shape: Optional[Tuple[int, int]] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Render a mesh to an RGB image and extract 2D keypoints.
 
     Uses pyrender or trimesh's offscreen rendering.
 
+    When using pyrender, the mesh is assumed to be in OpenCV camera coordinates
+    (Y-down, Z-forward). pyrender uses OpenGL convention (Y-up, Z-backward),
+    so we apply the OpenCV→OpenGL flip matrix to the camera pose to compensate.
+
+    When camera_intrinsics are provided, they must be for the original image
+    resolution. They are automatically scaled to the render resolution.
+
     Args:
         mesh: trimesh.Trimesh to render
         resolution: Output image resolution (square)
-        camera_intrinsics: (3,3) optional camera K matrix
-        camera_pose: (4,4) optional camera extrinsic matrix
+        camera_intrinsics: (3,3) optional camera K matrix (at original image resolution)
+        camera_pose: (4,4) optional camera extrinsic matrix (in OpenCV convention)
+        original_image_shape: (H, W) of the original image, needed for intrinsics scaling
 
     Returns:
         Tuple of (rendered_image (H,W,3), depth_map (H,W))
@@ -290,17 +317,52 @@ def render_mesh(
         fy = camera_intrinsics[1, 1]
         cx = camera_intrinsics[0, 2]
         cy = camera_intrinsics[1, 2]
+
+        # Scale intrinsics from original image resolution to render resolution
+        if original_image_shape is not None:
+            orig_h, orig_w = original_image_shape
+            scale_x = resolution / orig_w
+            scale_y = resolution / orig_h
+            fx *= scale_x
+            fy *= scale_y
+            cx *= scale_x
+            cy *= scale_y
+        else:
+            # Without original dimensions, assume intrinsics are already
+            # for the render resolution (backward compatibility)
+            pass
     else:
         # Default: fit camera to see the whole mesh
         fx = fy = resolution
         cx = cy = resolution / 2.0
 
     camera = pyrender.IntrinsicsCamera(fx=fx, fy=fy, cx=cx, cy=cy, znear=0.01, zfar=100.0)
-    camera_node = scene.add(camera, pose=camera_pose if camera_pose is not None else np.eye(4))
 
-    # Add lighting
+    # OpenCV convention: Y-down, Z-forward
+    # OpenGL convention: Y-up, Z-backward (camera looks along -Z)
+    # We apply the conversion matrix so the mesh (in OpenCV coords) is
+    # rendered correctly by the OpenGL camera.
+    #   OpenGL_pose = OpenCV_pose @ flip_matrix
+    # where flip_matrix flips Y and Z axes.
+    cv2gl = np.array([
+        [1,  0,  0, 0],
+        [0, -1,  0, 0],
+        [0,  0, -1, 0],
+        [0,  0,  0, 1],
+    ], dtype=np.float64)
+
+    if camera_pose is not None:
+        gl_camera_pose = camera_pose @ cv2gl
+    else:
+        # Camera at origin in OpenCV convention → in OpenGL, the camera
+        # needs to be placed so it looks along -Z at the scene.
+        gl_camera_pose = cv2gl
+
+    camera_node = scene.add(camera, pose=gl_camera_pose)
+
+    # Add lighting (in the same frame as the camera)
     light = pyrender.DirectionalLight(color=[1.0, 1.0, 1.0], intensity=3.0)
-    scene.add(light, pose=camera_pose if camera_pose is not None else np.eye(4))
+    scene.add(light, pose=gl_camera_pose)
 
     renderer = pyrender.OffscreenRenderer(resolution, resolution)
     color, depth = renderer.render(scene)
@@ -368,6 +430,7 @@ def render_mesh_for_marco(
     transform: np.ndarray,
     camera_intrinsics: np.ndarray,
     resolution: int = 512,
+    original_image_shape: Optional[Tuple[int, int]] = None,
 ) -> np.ndarray:
     """Render a mesh with its transform for MARCO comparison.
 
@@ -377,8 +440,9 @@ def render_mesh_for_marco(
     Args:
         mesh: The canonical mesh
         transform: (4,4) current pose of the mesh
-        camera_intrinsics: (3,3) camera K matrix
+        camera_intrinsics: (3,3) camera K matrix (at original image resolution)
         resolution: Render resolution
+        original_image_shape: (H, W) of the original image, for intrinsics scaling
 
     Returns:
         Rendered RGB image (H, W, 3)
@@ -396,6 +460,7 @@ def render_mesh_for_marco(
         resolution=resolution,
         camera_intrinsics=camera_intrinsics,
         camera_pose=camera_pose,
+        original_image_shape=original_image_shape,
     )
     return rgb
 
@@ -408,7 +473,7 @@ def crop_image_with_mask(
     mask: np.ndarray,
     padding: int = 20,
     background_color: Tuple[int, int, int] = (255, 255, 255),
-) -> Tuple[np.ndarray, np.ndarray]:
+) -> Tuple[np.ndarray, np.ndarray, Tuple[int, int]]:
     """Crop an image using bounding box and apply mask.
 
     Args:
@@ -419,7 +484,9 @@ def crop_image_with_mask(
         background_color: RGB color for masked-out regions
 
     Returns:
-        Tuple of (cropped_image (H', W', 3), crop_mask (H', W'))
+        Tuple of (cropped_image (H', W', 3), crop_mask (H', W'), crop_offset (x1, y1))
+        The crop_offset is the top-left corner of the crop in the original image,
+        useful for adjusting camera intrinsics when projecting from crop coordinates.
     """
     h, w = image.shape[:2]
     x1, y1, x2, y2 = bbox.astype(int)
@@ -439,7 +506,7 @@ def crop_image_with_mask(
     for c in range(3):
         crop[:, :, c][bg_mask] = background_color[c]
 
-    return crop, crop_mask
+    return crop, crop_mask, (x1, y1)
 
 
 def sample_keypoints_from_mask(

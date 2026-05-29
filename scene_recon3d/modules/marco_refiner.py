@@ -202,6 +202,7 @@ class MARCORefiner:
         obj: DetectedObject,
         camera_intrinsics: np.ndarray,
         render_resolution: int = 512,
+        original_image_shape: Optional[Tuple[int, int]] = None,
     ) -> DetectedObject:
         """Refine the pose of a single object using MARCO correspondences.
 
@@ -213,8 +214,9 @@ class MARCORefiner:
 
         Args:
             obj: DetectedObject with aligned mesh and initial pose
-            camera_intrinsics: (3,3) camera intrinsic matrix
+            camera_intrinsics: (3,3) camera intrinsic matrix (for the full image)
             render_resolution: Resolution for rendering the mesh
+            original_image_shape: (H, W) of the original image, for intrinsics scaling
 
         Returns:
             Updated DetectedObject with refined pose
@@ -269,6 +271,7 @@ class MARCORefiner:
                     current_transform,
                     camera_intrinsics,
                     resolution=render_resolution,
+                    original_image_shape=original_image_shape,
                 )
             except Exception as e:
                 logger.warning(f"Rendering failed for object {obj.object_id}: {e}")
@@ -327,13 +330,25 @@ class MARCORefiner:
                 src_kps_original[:, 1] /= h_ratio
 
             try:
-                # Get 3D points on the canonical mesh
-                # We use the crop bbox to establish a mapping from
-                # crop image coords to mesh coords
+                # Get 3D points on the canonical mesh.
+                # CRITICAL: keypoints are in crop-image pixel coordinates,
+                # but camera_intrinsics are for the full image. We must
+                # adjust the principal point (cx, cy) by the crop offset
+                # so that rays are cast correctly from the crop region.
+                K_crop = camera_intrinsics.copy()
+                if obj.crop_offset is not None:
+                    K_crop[0, 2] -= obj.crop_offset[0]  # cx -= x_offset
+                    K_crop[1, 2] -= obj.crop_offset[1]  # cy -= y_offset
+                else:
+                    # Fallback: estimate offset from bbox (less accurate)
+                    x1, y1 = obj.bbox_2d[:2].astype(int)
+                    K_crop[0, 2] -= x1
+                    K_crop[1, 2] -= y1
+
                 points_3d = get_mesh_3d_points_for_2d_keypoints(
                     obj.mesh,
                     src_kps_original,
-                    camera_intrinsics,
+                    K_crop,
                     mesh_transform=None,  # canonical mesh
                 )
             except Exception as e:
@@ -388,6 +403,7 @@ class MARCORefiner:
         objects: List[DetectedObject],
         camera_intrinsics: np.ndarray,
         render_resolution: int = 512,
+        original_image_shape: Optional[Tuple[int, int]] = None,
     ) -> List[DetectedObject]:
         """Refine poses for all objects using MARCO correspondences.
 
@@ -395,6 +411,7 @@ class MARCORefiner:
             objects: List of DetectedObject with aligned meshes
             camera_intrinsics: (3,3) camera intrinsic matrix
             render_resolution: Resolution for rendering meshes
+            original_image_shape: (H, W) of the original image, for intrinsics scaling
 
         Returns:
             Updated list of DetectedObject with refined poses
@@ -406,7 +423,8 @@ class MARCORefiner:
         for obj in objects:
             if obj.aligned_mesh is not None:
                 obj = self.refine_single_object(
-                    obj, camera_intrinsics, render_resolution
+                    obj, camera_intrinsics, render_resolution,
+                    original_image_shape=original_image_shape,
                 )
             refined_objects.append(obj)
 

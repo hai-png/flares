@@ -345,7 +345,7 @@ class Hunyuan3DGenerator:
         padding: int = 20,
         background_color: Tuple[int, int, int] = (255, 255, 255),
         min_size: int = 64,
-    ) -> Tuple[Image.Image, np.ndarray]:
+    ) -> Tuple[Image.Image, np.ndarray, Tuple[int, int]]:
         """Prepare an object crop image for Hunyuan3D.
 
         Crops the object from the scene using its bbox and mask,
@@ -361,10 +361,10 @@ class Hunyuan3DGenerator:
             min_size: Minimum crop dimension
 
         Returns:
-            Tuple of (PIL RGBA image, crop_mask (H', W'))
+            Tuple of (PIL RGBA image, crop_mask (H', W'), crop_offset (x1, y1))
         """
         # Crop with mask
-        crop, crop_mask = crop_image_with_mask(
+        crop, crop_mask, crop_offset = crop_image_with_mask(
             image, bbox, mask, padding=padding, background_color=background_color
         )
 
@@ -383,7 +383,7 @@ class Hunyuan3DGenerator:
             )
 
         pil_image = Image.fromarray(rgba, mode="RGBA")
-        return pil_image, crop_mask
+        return pil_image, crop_mask, crop_offset
 
     def unload_model(self):
         """Unload all Hunyuan3D pipelines from GPU / CPU memory.
@@ -497,7 +497,13 @@ class Hunyuan3DGenerator:
                 )
 
                 # Reload the textured mesh
-                mesh = trimesh.load(output_path)
+                loaded = trimesh.load(output_path)
+                # trimesh.load may return a Scene for multi-geometry GLBs;
+                # convert to a single Trimesh for consistent downstream use.
+                if isinstance(loaded, trimesh.Scene):
+                    mesh = loaded.to_mesh()
+                else:
+                    mesh = loaded
 
                 # Clean up temp file
                 if os.path.exists(untextured_path):
@@ -505,6 +511,9 @@ class Hunyuan3DGenerator:
 
             except Exception as e:
                 logger.warning(f"Texture generation failed: {e}. Using untextured mesh.")
+                # Save untextured mesh as fallback (the paint pipeline's
+                # output path was never written, so we must save here)
+                mesh.export(output_path)
 
         # Save if path provided
         if output_path and not (self.paint_pipeline is not None):
@@ -545,7 +554,7 @@ class Hunyuan3DGenerator:
             )
 
             # Prepare the object image
-            pil_image, crop_mask = self.prepare_object_image(
+            pil_image, crop_mask, crop_offset = self.prepare_object_image(
                 scene_image,
                 obj.bbox_2d,
                 obj.mask_2d,
@@ -555,6 +564,7 @@ class Hunyuan3DGenerator:
             # Store the crop info
             obj.crop_image = np.array(pil_image)[:, :, :3]
             obj.crop_mask = crop_mask
+            obj.crop_offset = crop_offset
 
             # Generate mesh
             output_path = os.path.join(
