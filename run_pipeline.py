@@ -170,7 +170,8 @@ Examples:
     parser.add_argument("--guidance", type=float, default=None, help="Hunyuan3D guidance scale")
     parser.add_argument("--no-texture", action="store_true", help="Skip texture generation")
     parser.add_argument("--refinement-iters", type=int, default=None, help="MARCO refinement iterations")
-    parser.add_argument("--preload", action="store_true", help="Pre-load all models before running")
+    parser.add_argument("--preload", action="store_true", help="Pre-load all models before running (ignored in low VRAM mode)")
+    parser.add_argument("--no-low-vram", action="store_true", help="Disable low VRAM mode (keep all models in GPU, needs ~25GB)")
     parser.add_argument("--check-env", action="store_true", help="Check environment and exit")
 
     # Logging
@@ -218,6 +219,7 @@ Examples:
         pipeline = SceneReconstructionPipeline(
             device=args.device,
             output_dir=args.output,
+            low_vram_mode=not args.no_low_vram,
         )
 
     # Apply CLI overrides

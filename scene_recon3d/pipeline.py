@@ -126,6 +126,7 @@ class SceneReconstructionPipeline:
         save_intermediate: bool = True,
         render_resolution: int = 512,
         min_object_area: int = 100,
+        low_vram_mode: bool = True,
     ):
         """Initialize the pipeline with all module configurations.
 
@@ -151,12 +152,14 @@ class SceneReconstructionPipeline:
             save_intermediate: Save intermediate results
             render_resolution: Resolution for mesh rendering
             min_object_area: Minimum mask area to process an object
+            low_vram_mode: Load/unload models stage-by-stage to fit in 15GB VRAM
         """
         self.device = device
         self.output_dir = output_dir
         self.save_intermediate = save_intermediate
         self.render_resolution = render_resolution
         self.min_object_area = min_object_area
+        self.low_vram_mode = low_vram_mode
 
         # Initialize all modules (lazy loading - models loaded on first use)
         self.detector = RFDETRDetector(
@@ -242,29 +245,100 @@ class SceneReconstructionPipeline:
             save_intermediate=pipeline.get("save_intermediate", True),
             render_resolution=pipeline.get("render_resolution", 512),
             min_object_area=pipeline.get("min_object_area", 100),
+            low_vram_mode=pipeline.get("low_vram_mode", True),
         )
+
+    @staticmethod
+    def _gpu_mem_info() -> str:
+        """Return a short GPU memory summary string."""
+        try:
+            import torch
+            if torch.cuda.is_available():
+                alloc = torch.cuda.memory_allocated() / 1024**3
+                reserved = torch.cuda.memory_reserved() / 1024**3
+                total = torch.cuda.get_device_properties(0).total_mem / 1024**3
+                return f"GPU: {alloc:.1f}/{total:.1f}GB used, {reserved:.1f}GB reserved"
+        except Exception:
+            pass
+        return ""
+
+    def _unload_model(self, module_name: str):
+        """Unload a model from GPU memory to free VRAM.
+
+        Sets the model reference to None and calls CUDA garbage collection.
+        The model will be re-loaded on next use (lazy loading).
+        """
+        if module_name == "detector" and self.detector.model is not None:
+            logger.info(f"Unloading RF-DETR from GPU to free VRAM... {self._gpu_mem_info()}")
+            self.detector.model = None
+        elif module_name == "estimator_3d" and self.estimator_3d.model is not None:
+            logger.info(f"Unloading WildDet3D from GPU to free VRAM... {self._gpu_mem_info()}")
+            self.estimator_3d.model = None
+        elif module_name == "generator" and self.generator.shape_pipeline is not None:
+            logger.info(f"Unloading Hunyuan3D from GPU to free VRAM... {self._gpu_mem_info()}")
+            self.generator.shape_pipeline = None
+            self.generator.paint_pipeline = None
+        elif module_name == "refiner" and self.refiner.model is not None:
+            logger.info(f"Unloading MARCO from GPU to free VRAM... {self._gpu_mem_info()}")
+            self.refiner.model = None
+        else:
+            return  # Nothing to unload
+
+        import gc
+        import torch
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+        logger.info(f"  After unload: {self._gpu_mem_info()}")
 
     def load_all_models(self):
         """Pre-load all models before running the pipeline.
 
-        This is optional but recommended to avoid lazy loading during
-        the first pipeline run, which can cause delays.
+        In low_vram_mode (default True), models are loaded stage-by-stage
+        during pipeline execution and unloaded after each stage completes.
+        This keeps GPU memory usage under ~10GB to fit on T4 (15GB VRAM).
+
+        When low_vram_mode=False, all models are loaded at once (needs ~25GB VRAM).
         """
-        logger.info("Pre-loading all pipeline models...")
-
-        logger.info("[1/4] Loading RF-DETR...")
-        self.detector.load_model()
-
-        logger.info("[2/4] Loading WildDet3D...")
-        self.estimator_3d.load_model()
-
-        logger.info("[3/4] Loading Hunyuan3D-2.1 + FlashVDM...")
-        self.generator.load_model()
-
-        logger.info("[4/4] Loading MARCO...")
-        self.refiner.load_model()
-
-        logger.info("All models loaded successfully!")
+        if self.low_vram_mode:
+            logger.info(
+                "Low VRAM mode enabled — models will be loaded/unloaded "
+                "stage-by-stage during pipeline execution. "
+                "This keeps GPU usage under ~10GB for T4 compatibility."
+            )
+            # Do a quick import check to verify all modules are importable,
+            # but don't actually load the heavy model weights.
+            logger.info("Verifying all modules are importable (without loading weights)...")
+            try:
+                import rfdetr  # noqa: F401
+                logger.info("  ✓ RF-DETR importable")
+            except ImportError as e:
+                logger.error(f"  ✗ RF-DETR not importable: {e}")
+            try:
+                from scene_recon3d.utils.setup_paths import setup_repo_paths
+                setup_repo_paths()
+                from wilddet3d import build_model  # noqa: F401
+                logger.info("  ✓ WildDet3D importable")
+            except ImportError as e:
+                logger.error(f"  ✗ WildDet3D not importable: {e}")
+            try:
+                from hy3dshape.pipelines import Hunyuan3DDiTFlowMatchingPipeline  # noqa: F401
+                logger.info("  ✓ Hunyuan3D importable")
+            except ImportError as e:
+                logger.error(f"  ✗ Hunyuan3D not importable: {e}")
+            logger.info("Low VRAM mode ready — models will load on demand")
+        else:
+            logger.info("Pre-loading all pipeline models (requires ~25GB VRAM)...")
+            logger.info("[1/4] Loading RF-DETR...")
+            self.detector.load_model()
+            logger.info("[2/4] Loading WildDet3D...")
+            self.estimator_3d.load_model()
+            logger.info("[3/4] Loading Hunyuan3D-2.1 + FlashVDM...")
+            self.generator.load_model()
+            logger.info("[4/4] Loading MARCO...")
+            self.refiner.load_model()
+            logger.info("All models loaded successfully!")
 
     def reconstruct(
         self,
@@ -321,6 +395,10 @@ class SceneReconstructionPipeline:
             import cv2
             cv2.imwrite(os.path.join(output_dir, "1_detections.png"), cv2.cvtColor(vis, cv2.COLOR_RGB2BGR))
 
+        # Free RF-DETR from GPU before loading WildDet3D (low VRAM mode)
+        if self.low_vram_mode:
+            self._unload_model("detector")
+
         # ═══════════════════════════════════════════════════════════
         # Stage 2: WildDet3D — 3D Bounding Box Estimation
         # ═══════════════════════════════════════════════════════════
@@ -336,6 +414,11 @@ class SceneReconstructionPipeline:
         self._stats.stage_times["2_wilddet3d"] = time.time() - t0
         self._stats.num_objects_3d = sum(1 for o in objects if o.bbox_3d is not None)
 
+        # Free WildDet3D from GPU before loading Hunyuan3D (low VRAM mode)
+        # Hunyuan3D is the heaviest model (~7-10GB VRAM) and needs the space
+        if self.low_vram_mode:
+            self._unload_model("estimator_3d")
+
         # ═══════════════════════════════════════════════════════════
         # Stage 3: Hunyuan3D — Per-Object 3D Mesh Generation
         # ═══════════════════════════════════════════════════════════
@@ -350,6 +433,10 @@ class SceneReconstructionPipeline:
         )
         self._stats.stage_times["3_hunyuan3d"] = time.time() - t0
         self._stats.num_objects_meshed = sum(1 for o in objects if o.mesh is not None)
+
+        # Free Hunyuan3D from GPU — it's the heaviest model and Stage 4 is CPU-only
+        if self.low_vram_mode:
+            self._unload_model("generator")
 
         # ═══════════════════════════════════════════════════════════
         # Stage 4: Scale & Pose Alignment using 3D Bounding Boxes

@@ -51,3 +51,4 @@ pipeline:
   refinement_iterations: 3          # Number of MARCO refinement iterations
   min_object_area: 100              # Min pixel area for an object mask to process
   background_color: [255, 255, 255] # Background color for masked crops
+  low_vram_mode: true               # Load/unload models stage-by-stage (required for T4 15GB)
