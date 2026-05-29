@@ -59,7 +59,7 @@ class Hunyuan3DGenerator:
         num_inference_steps: int = 50,
         guidance_scale: float = 5.0,
         octree_resolution: int = 384,
-        mc_algo: str = "dmc",
+        mc_algo: str = "mc",
         generate_texture: bool = True,
         texture_max_num_view: int = 6,
         texture_resolution: int = 512,
@@ -80,7 +80,8 @@ class Hunyuan3DGenerator:
             num_inference_steps: Flow-matching denoising steps (50 standard, 5 turbo)
             guidance_scale: Classifier-free guidance scale
             octree_resolution: Mesh resolution (higher = finer)
-            mc_algo: Marching cubes algorithm ('mc' or 'dmc')
+            mc_algo: Marching cubes algorithm ('mc' for standard, 'dmc' for
+                     differentiable — requires 'diso' package installed)
             generate_texture: Whether to run texture generation stage
             texture_max_num_view: Number of views for texture generation
             texture_resolution: Resolution per view for texturing

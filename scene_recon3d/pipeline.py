@@ -511,7 +511,8 @@ class SceneReconstructionPipeline:
             if obj.mesh is None or obj.bbox_3d is None:
                 logger.warning(
                     f"Object {obj.object_id}: skipping alignment "
-                    f"(mesh={'✓' if obj.mesh else '✗'}, 3D bbox={'✓' if obj.bbox_3d else '✗'})"
+                    f"(mesh={'✓' if obj.mesh is not None else '✗'}, "
+                    f"3D bbox={'✓' if obj.bbox_3d is not None else '✗'})"
                 )
                 continue
 
