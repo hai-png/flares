@@ -67,7 +67,7 @@ class Hunyuan3DGenerator:
         realesrgan_ckpt: str = "hy3dpaint/ckpt/RealESRGAN_x4plus.pth",
         device: str = "cuda",
         dtype: str = "float16",
-        low_vram_mode: bool = True,
+        low_vram_mode: bool = False,
     ):
         """Initialize Hunyuan3D generator.
 
@@ -89,6 +89,9 @@ class Hunyuan3DGenerator:
             realesrgan_ckpt: Path to RealESRGAN checkpoint for super-resolution
             device: Device to run on
             dtype: Data type ('float16', 'bfloat16', 'float32')
+            low_vram_mode: When True, reduces octree_resolution and inference
+                           steps to lower GPU memory usage.  Auto-detected from
+                           available VRAM when not explicitly set.
         """
         self.model_path = model_path
         self.subfolder = subfolder
@@ -107,6 +110,22 @@ class Hunyuan3DGenerator:
         self.device = device
         self.dtype = dtype
         self.low_vram_mode = low_vram_mode
+
+        # Auto-detect low VRAM mode when not explicitly set: if the GPU has
+        # less than 16 GB, reduce memory-intensive parameters automatically.
+        if not self.low_vram_mode:
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    total_vram_gb = torch.cuda.get_device_properties(0).total_mem / (1024 ** 3)
+                    if total_vram_gb < 16:
+                        logger.info(
+                            f"GPU has {total_vram_gb:.1f} GB VRAM — "
+                            "auto-enabling conservative memory settings"
+                        )
+                        self.low_vram_mode = True
+            except Exception:
+                pass
 
         # In low VRAM mode, apply conservative defaults that reduce peak memory
         if self.low_vram_mode:
@@ -392,7 +411,7 @@ class Hunyuan3DGenerator:
         padding: int = 20,
         background_color: Tuple[int, int, int] = (255, 255, 255),
         min_size: int = 64,
-    ) -> Tuple[Image.Image, np.ndarray, Tuple[int, int]]:
+    ) -> Tuple[Image.Image, np.ndarray, Tuple[int, int], float]:
         """Prepare an object crop image for Hunyuan3D.
 
         Crops the object from the scene using its bbox and mask,
@@ -408,7 +427,9 @@ class Hunyuan3DGenerator:
             min_size: Minimum crop dimension
 
         Returns:
-            Tuple of (PIL RGBA image, crop_mask (H', W'), crop_offset (x1, y1))
+            Tuple of (PIL RGBA image, crop_mask (H', W'),
+                      crop_offset (x1, y1), crop_scale)
+            crop_scale is 1.0 unless the crop was upscaled to meet min_size.
         """
         # Crop with mask
         crop, crop_mask, crop_offset = crop_image_with_mask(
@@ -442,7 +463,7 @@ class Hunyuan3DGenerator:
             ) > 127  # Convert back to boolean
 
         pil_image = Image.fromarray(rgba, mode="RGBA")
-        return pil_image, crop_mask, crop_offset
+        return pil_image, crop_mask, crop_offset, crop_scale
 
     def unload_model(self):
         """Unload all Hunyuan3D pipelines from GPU / CPU memory.
@@ -681,7 +702,7 @@ class Hunyuan3DGenerator:
             )
 
             # Prepare the object image
-            pil_image, crop_mask, crop_offset = self.prepare_object_image(
+            pil_image, crop_mask, crop_offset, crop_scale = self.prepare_object_image(
                 scene_image,
                 obj.bbox_2d,
                 obj.mask_2d,
@@ -692,6 +713,7 @@ class Hunyuan3DGenerator:
             obj.crop_image = np.array(pil_image)[:, :, :3]
             obj.crop_mask = crop_mask
             obj.crop_offset = crop_offset
+            obj.crop_scale = crop_scale
 
             # Generate mesh
             output_path = os.path.join(

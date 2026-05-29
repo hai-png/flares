@@ -144,6 +144,15 @@ class MARCORefiner:
         Given a source image with labeled keypoints and a target image,
         predicts where those same semantic keypoints appear in the target.
 
+        MARCO's preprocess_data resizes the longest side to inference_res
+        and bottom-right pads to a square.  Source keypoints are scaled from
+        original pixels into the resized (top-left aligned) space by
+        preprocess_data.  The model's predict_from_logits outputs target
+        keypoints in the *padded square* pixel space.  Because the image
+        content is top-left aligned (bottom-right padding), the padded-space
+        coordinates are the same as resized-space coordinates, so converting
+        back only requires dividing by the resize scale factor.
+
         Args:
             source_image: (H, W, 3) uint8 source image (cropped object)
             target_image: (H, W, 3) uint8 target image (rendered mesh)
@@ -177,17 +186,20 @@ class MARCORefiner:
             with torch.no_grad():
                 pred_kps = self.model(**inputs)
 
-            pred_kps_np = pred_kps.cpu().numpy()[0]  # (N, 2)
+            pred_kps_np = pred_kps.cpu().numpy()[0]  # (N, 2) in padded-square space
 
-            # Convert from MARCO's resized+padded space back to original
+            # MARCO pads bottom-right (top-left aligned), so padded-space
+            # coordinates equal resized-space coordinates.  The scale factor
+            # from original → resized is the same for both X and Y because
+            # the resize preserves aspect ratio:
+            #   scale = inference_res / max(orig_w, orig_h)
+            # To go back: coord_original = coord_padded / scale
             tgt_h, tgt_w = target_image.shape[:2]
             scale = self.inference_res / max(tgt_h, tgt_w)
-            pad_w = self.inference_res - int(tgt_w * scale)
-            pad_h = self.inference_res - int(tgt_h * scale)
 
             pred_original = np.zeros_like(pred_kps_np)
-            pred_original[:, 0] = (pred_kps_np[:, 0] - pad_w / 2) / scale
-            pred_original[:, 1] = (pred_kps_np[:, 1] - pad_h / 2) / scale
+            pred_original[:, 0] = pred_kps_np[:, 0] / scale
+            pred_original[:, 1] = pred_kps_np[:, 1] / scale
 
             return source_keypoints, pred_original
 
@@ -411,6 +423,14 @@ class MARCORefiner:
             # Undo the render_resolution scaling first
             src_kps_full[:, 0] /= w_ratio
             src_kps_full[:, 1] /= h_ratio
+            # Now keypoints are in crop_image pixel coordinates.
+            # If the crop was resized (crop_scale != 1.0), undo that too
+            # to get back to the original (un-resized) crop coordinates
+            # which match the crop_offset.
+            crop_scale = obj.crop_scale if obj.crop_scale is not None else 1.0
+            if crop_scale != 1.0:
+                src_kps_full[:, 0] /= crop_scale
+                src_kps_full[:, 1] /= crop_scale
             # Add crop offset to get full-image coordinates
             if obj.crop_offset is not None:
                 src_kps_full[:, 0] += obj.crop_offset[0]

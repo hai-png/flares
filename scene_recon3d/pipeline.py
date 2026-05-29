@@ -126,7 +126,7 @@ class SceneReconstructionPipeline:
         save_intermediate: bool = True,
         render_resolution: int = 512,
         min_object_area: int = 100,
-        low_vram_mode: bool = True,
+        low_vram_mode: bool = False,
     ):
         """Initialize the pipeline with all module configurations.
 

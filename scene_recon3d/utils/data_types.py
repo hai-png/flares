@@ -22,6 +22,7 @@ class DetectedObject:
     crop_image: Optional[np.ndarray] = None  # (H, W, 3) uint8 cropped+masked image
     crop_mask: Optional[np.ndarray] = None   # (H, W) boolean mask for the crop
     crop_offset: Optional[Tuple[int, int]] = None  # (x1, y1) top-left of crop in original image
+    crop_scale: float = 1.0  # Scale factor if crop was resized (crop_scale != 1 when min_size triggered a resize)
 
     # 3D bounding box (from WildDet3D)
     bbox_3d: Optional[np.ndarray] = None     # (10,) cx,cy,cz,w,l,h,qw,qx,qy,qz

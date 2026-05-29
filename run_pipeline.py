@@ -199,6 +199,7 @@ Examples:
     parser.add_argument("--refinement-iters", type=int, default=None, help="MARCO refinement iterations")
     parser.add_argument("--preload", action="store_true", help="Pre-load all models before running (ignored in low VRAM mode)")
     parser.add_argument("--no-low-vram", action="store_true", help="Disable low VRAM mode (keep all models in GPU, needs ~25GB)")
+    parser.add_argument("--low-vram", action="store_true", help="Force low VRAM mode (auto-detected by default)")
     parser.add_argument("--check-env", action="store_true", help="Check environment and exit")
 
     # Logging
@@ -239,14 +240,28 @@ Examples:
     # --- Build Pipeline ---
     from scene_recon3d.pipeline import SceneReconstructionPipeline
 
+    # Determine low VRAM mode from CLI flags
+    if args.no_low_vram:
+        low_vram_flag = False
+    elif args.low_vram:
+        low_vram_flag = True
+    else:
+        low_vram_flag = False  # Auto-detected inside Hunyuan3DGenerator based on GPU VRAM
+
     if args.config:
         logger.info(f"Loading config from {args.config}")
         pipeline = SceneReconstructionPipeline.from_config(args.config)
+        if args.no_low_vram:
+            pipeline.low_vram_mode = False
+            pipeline.generator.low_vram_mode = False
+        elif args.low_vram:
+            pipeline.low_vram_mode = True
+            pipeline.generator.low_vram_mode = True
     else:
         pipeline = SceneReconstructionPipeline(
             device=args.device,
             output_dir=args.output,
-            low_vram_mode=not args.no_low_vram,
+            low_vram_mode=low_vram_flag,  # Auto-detected if neither flag is set
         )
 
     # Apply CLI overrides

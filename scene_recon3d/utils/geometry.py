@@ -139,37 +139,36 @@ def align_mesh_to_bbox(
     bbox_center: np.ndarray,
     bbox_dims: np.ndarray,
     bbox_quat: np.ndarray,
-    bbox_up_axis: str = "y",
     camera_intrinsics: Optional[np.ndarray] = None,
     bbox_2d: Optional[np.ndarray] = None,
 ) -> Tuple[trimesh.Trimesh, float, np.ndarray, np.ndarray]:
     """Align a canonically-posed mesh to a 3D bounding box.
 
-    The generated mesh from Hunyuan3D is in a canonical pose centered at origin
-    in Y-up convention (X-right, Y-up, Z-toward-viewer).
+    The generated mesh from Hunyuan3D is in a canonical pose centered at
+    origin in Y-up convention (X-right, Y-up, Z-toward-viewer).  The mesh
+    fits within a bounding box of approximately [-1, 1] on each axis.
 
     WildDet3D outputs bounding boxes in OpenCV camera coordinates (X-right,
     Y-down, Z-forward) with dimensions (W, L, H) where:
-      - W (width)  maps to Z-axis in the bbox's local frame (forward/backward)
-      - L (length) maps to X-axis in the bbox's local frame (left/right)
-      - H (height) maps to Y-axis in the bbox's local frame (down/up)
+      - W (width)  maps to Z-axis in the bbox's local frame
+      - L (length) maps to X-axis in the bbox's local frame
+      - H (height) maps to Y-axis in the bbox's local frame
 
     Convention-based axis mapping (mesh → bbox local frame):
-      mesh X (width)  → bbox X (L)   — both are left/right
-      mesh Y (up)     → bbox -Y (H)  — up ↔ down flip via R_axis
-      mesh Z (depth)  → bbox Z (W)   — both are forward/backward
+      mesh X → bbox local X (L) — both are left/right
+      mesh Y → bbox local -Y (H) — up ↔ down flip via R_axis
+      mesh Z → bbox local -Z (W) — toward-viewer ↔ forward flip
 
     The quaternion R_quat then rotates from the bbox local frame to camera
     coordinates.  When camera intrinsics and the 2D detection box are
-    available, both X/Z orientations are tested and the one with higher
-    2D projection IoU is selected.
+    available, multiple axis permutations are tested and the one with
+    the highest 2D projection IoU is selected.
 
     Args:
         mesh: The canonical trimesh.Trimesh object
         bbox_center: (3,) 3D center of the bounding box in meters
         bbox_dims: (3,) (W, L, H) dimensions in meters from WildDet3D
         bbox_quat: (4,) (qw, qx, qy, qz) quaternion for rotation
-        bbox_up_axis: Up axis convention ("y" for WildDet3D/OpenCV)
         camera_intrinsics: Optional (3,3) camera K matrix for 2D validation
         bbox_2d: Optional (4,) xyxy 2D detection bbox for validation
 
@@ -184,20 +183,19 @@ def align_mesh_to_bbox(
     # ── Remap bbox dimensions to match mesh axes ──────────────────
     #
     # WildDet3D bbox_dims = (W, L, H) where:
-    #   W → bbox local Z ↔ mesh Z (depth)
+    #   W → bbox local Z ↔ mesh -Z (depth, with direction flip)
     #   L → bbox local X ↔ mesh X (width)
-    #   H → bbox local Y ↔ mesh Y (height, with sign flip for up/down)
+    #   H → bbox local Y ↔ mesh -Y (height, with up/down flip)
+    #
+    # Direct correspondence (before axis conversion):
+    #   bbox local (X, Y, Z) = (L, H, W)
+    #   mesh (X, Y, Z) in the canonical Y-up frame maps to:
+    #     mesh X → bbox X (L), mesh Y → bbox -Y (H), mesh Z → bbox -Z (W)
+    #
+    # After R_axis (Y-up→Y-down, Z-toward→Z-forward), the extents match
+    # directly because R_axis only flips signs (preserving magnitude).
     W, L, H = float(bbox_dims[0]), float(bbox_dims[1]), float(bbox_dims[2])
-    # Direct correspondence: bbox local (X, Y, Z) = (L, H, W)
-    # This maps directly to mesh (X, Y, Z) in the canonical Y-up frame
     bbox_dims_mapped = np.array([L, H, W], dtype=np.float64)
-
-    # ── Scale computation ─────────────────────────────────────────
-    # Per-axis scale ratios: how much to scale each mesh axis to fit bbox
-    scale_ratios = bbox_dims_mapped / mesh_extents_safe
-    # Use median for robustness — avoids both under-scaling (min) and
-    # over-scaling (max) when mesh and bbox shapes don't match perfectly
-    scale_factor = float(np.median(scale_ratios))
 
     # ── Rotation from quaternion ──────────────────────────────────
     R_quat = quaternion_to_rotation_matrix(bbox_quat)
@@ -205,63 +203,57 @@ def align_mesh_to_bbox(
     # ── Axis convention conversion ────────────────────────────────
     # Hunyuan3D mesh: X-right, Y-up, Z-toward-viewer
     # OpenCV camera:  X-right, Y-down, Z-forward
-    # Conversion: (x, y, z)_mesh → (x, -y, -z)_camera
-    # diag(1, -1, -1) is a proper rotation (det = +1) that flips Y and Z
-    if bbox_up_axis == "y":
-        R_axis = np.array([
-            [1,  0,  0],
-            [0, -1,  0],
-            [0,  0, -1],
-        ], dtype=np.float64)
-    else:
-        R_axis = np.eye(3, dtype=np.float64)
-
-    # ── Determine the best axis mapping ───────────────────────────
-    # Convention: mesh (X, Y, Z) → bbox local (X, Y, Z) directly
-    # But for X and Z, there are 2 possible orderings (swap or no swap).
-    # When camera intrinsics are available, we test both and pick the
-    # one whose 2D projection best matches the detected 2D bbox.
-
-    # Option 1: identity — mesh X→bbox X, mesh Z→bbox Z
-    R_perm_identity = np.eye(3, dtype=np.float64)
-
-    # Option 2: swap X and Z — mesh X→bbox Z, mesh Z→bbox X
-    # This is a 90° rotation around Y axis
-    R_perm_swap = np.array([
-        [0, 0, 1],
-        [0, 1, 0],
-        [1, 0, 0],
+    # Conversion: (x, y, z)_mesh → (x, -y, -z)_opencv
+    # diag(1, -1, -1) is a proper rotation (det = +1).
+    R_axis = np.array([
+        [1,  0,  0],
+        [0, -1,  0],
+        [0,  0, -1],
     ], dtype=np.float64)
-    # det = -1, so negate smallest-dimension row to make it proper
-    # The smallest bbox dimension is typically the depth, which maps to
-    # the swapped axis. Negate the row with the smallest bbox dimension.
-    # For swap, the X row becomes [0,0,1] (maps from mesh Z) and Z row
-    # becomes [1,0,0] (maps from mesh X). Negate the one mapping to the
-    # smallest bbox dimension.
-    if W < L:
-        # Z axis (W) is smaller than X axis (L), negate Z row
-        R_perm_swap[2] *= -1
-    else:
-        R_perm_swap[0] *= -1
 
-    # Recompute scale for the swap option
-    scale_ratios_swap = np.array([
-        bbox_dims_mapped[2] / mesh_extents_safe[0],  # mesh X → bbox Z (W)
-        bbox_dims_mapped[1] / mesh_extents_safe[1],  # mesh Y → bbox Y (H)
-        bbox_dims_mapped[0] / mesh_extents_safe[2],  # mesh Z → bbox X (L)
-    ])
-    scale_factor_swap = float(np.median(scale_ratios_swap))
+    # ── Candidate permutations ────────────────────────────────────
+    # The generated mesh may not have a predictable alignment of its
+    # principal axes with the bbox axes.  We test four 90° rotations
+    # around the Y axis (which preserve the Y-up / Y-down relationship)
+    # and pick the one with the best 2D projection IoU.
+    #
+    # All four are proper rotations (det = +1):
+    #   0°: identity
+    #   90°: rotates X→-Z, Z→X
+    #  180°: rotates X→-X, Z→-Z
+    #  270°: rotates X→Z, Z→-X
+    R_perms = [
+        ("0deg", np.eye(3, dtype=np.float64)),
+        ("90deg", np.array([[0, 0, -1], [0, 1, 0], [1, 0, 0]], dtype=np.float64)),
+        ("180deg", np.array([[-1, 0, 0], [0, 1, 0], [0, 0, -1]], dtype=np.float64)),
+        ("270deg", np.array([[0, 0, 1], [0, 1, 0], [-1, 0, 0]], dtype=np.float64)),
+    ]
 
-    # Decide which option to use
-    use_swap = False
+    # Compute per-candidate scale factors and test 2D IoU.
+    #
+    # For each permutation R_perm, the effective dimension mapping is:
+    #   p_bbox = R_perm @ p_mesh  (after centering & axis conversion)
+    # So bbox_dims_mapped must be compared against the permuted mesh extents.
+    #
+    # The permuted mesh extents are: extents_perm[i] = sum_j |R_perm[i,j]| * mesh_extents[j]
+    # (because R_perm permutes/reflects axes, and extents are always positive)
+    candidates = []
+    for name, R_perm in R_perms:
+        # Compute the effective extent that each bbox axis "sees"
+        # after the permutation is applied to the mesh.
+        extents_perm = np.abs(R_perm) @ mesh_extents_safe
+        ratios = bbox_dims_mapped / np.maximum(extents_perm, 1e-6)
+        sf = float(np.median(ratios))
+        candidates.append((name, R_perm, sf, ratios))
 
+    # ── Select the best candidate ─────────────────────────────────
     if camera_intrinsics is not None and bbox_2d is not None:
-        # Test both options by computing 2D projection IoU
+        # Test each candidate by computing 2D projection IoU
         best_iou = -1.0
+        best_idx = 0
 
-        for perm, sf in [(R_perm_identity, scale_factor),
-                         (R_perm_swap, scale_factor_swap)]:
-            R = R_quat @ R_axis @ perm
+        for idx, (name, R_perm, sf, ratios) in enumerate(candidates):
+            R = R_quat @ R_axis @ R_perm
             test_mesh = mesh.copy()
             test_mesh.apply_translation(-mesh_center)
             test_mesh.apply_scale(sf)
@@ -272,28 +264,24 @@ def align_mesh_to_bbox(
             iou = _compute_alignment_2d_iou(test_mesh, bbox_2d, camera_intrinsics)
             if iou > best_iou:
                 best_iou = iou
-                use_swap = (perm is R_perm_swap)
+                best_idx = idx
 
+        best_name, R_perm, scale_factor, scale_ratios = candidates[best_idx]
         logger.info(
-            f"  2D validation: identity_IoU vs swap_IoU, "
-            f"chose {'swap' if use_swap else 'identity'}, "
-            f"best_IoU={best_iou:.3f}"
+            f"  2D validation: tested 4 Y-rotations, "
+            f"chose {best_name}, best_IoU={best_iou:.3f}"
         )
     else:
-        # Without 2D validation, use convention-based heuristic:
-        # If the direct scale ratios are more balanced, use identity.
-        # If the swap ratios are more balanced, use swap.
-        # "More balanced" = lower coefficient of variation (std/mean).
-        cv_direct = np.std(scale_ratios) / max(np.mean(scale_ratios), 1e-6)
-        cv_swap = np.std(scale_ratios_swap) / max(np.mean(scale_ratios_swap), 1e-6)
-        use_swap = cv_swap < cv_direct
-
-    if use_swap:
-        R_perm = R_perm_swap
-        scale_factor = scale_factor_swap
-        scale_ratios = scale_ratios_swap
-    else:
-        R_perm = R_perm_identity
+        # Without 2D validation, use the most balanced scale ratios
+        # (lowest coefficient of variation = std/mean)
+        best_cv = float("inf")
+        best_idx = 0
+        for idx, (name, R_perm, sf, ratios) in enumerate(candidates):
+            cv = np.std(ratios) / max(np.mean(ratios), 1e-6)
+            if cv < best_cv:
+                best_cv = cv
+                best_idx = idx
+        best_name, R_perm, scale_factor, scale_ratios = candidates[best_idx]
 
     R = R_quat @ R_axis @ R_perm
 
@@ -304,7 +292,7 @@ def align_mesh_to_bbox(
         f"mapped=(L={L:.3f}, H={H:.3f}, W={W:.3f}), "
         f"scale_ratios={scale_ratios}, "
         f"scale={scale_factor:.4f}, "
-        f"axis_swap={use_swap}"
+        f"perm={best_name}"
     )
 
     # ── Build the full transformation ─────────────────────────────
@@ -894,10 +882,10 @@ def _ray_mesh_intersect_moller_trumbore(
 ) -> Optional[np.ndarray]:
     """Möller–Trumbore ray-triangle intersection (single ray vs all triangles).
 
-    Pure-numpy fallback that does NOT require rtree or pyembree.
-    Tests the ray against every triangle and returns the closest hit.
-    Uses explicit numpy operations (no einsum) for maximum compatibility
-    across numpy versions and platforms.
+    Vectorised pure-numpy implementation that tests one ray against every
+    triangle and returns the closest hit.  No external acceleration
+    structure (rtree / embree) is required, making this portable across
+    all platforms and numpy versions.
 
     Args:
         ray_origin: (3,) ray origin
@@ -999,7 +987,10 @@ def get_mesh_3d_points_for_2d_keypoints(
     cx = camera_intrinsics[0, 2]
     cy = camera_intrinsics[1, 2]
 
-    # Determine which ray intersection method to use
+    # Use trimesh's accelerated ray casting when available (rtree/embree),
+    # otherwise fall back to the vectorised Möller–Trumbore implementation.
+    # Both produce identical results; trimesh's version is faster for large
+    # meshes when an acceleration structure is installed.
     use_trimesh_ray = False
     try:
         import rtree  # noqa: F401
@@ -1011,10 +1002,7 @@ def get_mesh_3d_points_for_2d_keypoints(
             import embree  # noqa: F401
             use_trimesh_ray = True
         except ImportError:
-            logger.debug(
-                "rtree/embree not installed — using Möller–Trumbore "
-                "ray-triangle intersection"
-            )
+            pass
 
     points_3d = []
     for kp in keypoints_2d:
@@ -1042,7 +1030,7 @@ def get_mesh_3d_points_for_2d_keypoints(
                 pass
 
         if not found:
-            # Pure-numpy fallback: Möller–Trumbore ray-triangle intersection
+            # Vectorised Möller–Trumbore ray-triangle intersection
             try:
                 hit = _ray_mesh_intersect_moller_trumbore(
                     ray_origin, ray_dir,
