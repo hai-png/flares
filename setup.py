@@ -38,6 +38,7 @@ setup(
             "pyrender",
             "open3d>=0.18",
             "pymeshlab",
+            "rtree>=1.0",
         ],
         "dev": [
             "pytest",

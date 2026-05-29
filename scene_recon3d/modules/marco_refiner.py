@@ -390,10 +390,12 @@ class MARCORefiner:
         # Apply refined translation
         obj.aligned_mesh.apply_translation(current_t)
 
+        init_R = obj.initial_rotation if obj.initial_rotation is not None else np.eye(3)
+        init_t = obj.initial_translation if obj.initial_translation is not None else np.zeros(3)
         logger.info(
             f"Object {obj.object_id} pose refined. "
-            f"Rotation diff: {np.linalg.norm(current_R - (obj.initial_rotation or np.eye(3))):.4f}, "
-            f"Translation diff: {np.linalg.norm(current_t - (obj.initial_translation or np.zeros(3))):.4f}"
+            f"Rotation diff: {np.linalg.norm(current_R - init_R):.4f}, "
+            f"Translation diff: {np.linalg.norm(current_t - init_t):.4f}"
         )
 
         return obj

@@ -11,11 +11,14 @@ Provides functions for:
 
 from __future__ import annotations
 
+import logging
 import numpy as np
 import cv2
 import trimesh
 from typing import Optional, Tuple, List
 from scipy.spatial.transform import Rotation
+
+logger = logging.getLogger(__name__)
 
 
 # ─── Quaternion / Rotation Conversions ───────────────────────────
@@ -576,6 +579,81 @@ def sample_keypoints_from_mask(
         return np.stack([xs[indices], ys[indices]], axis=1).astype(np.float32)
 
 
+def _ray_mesh_intersect_moller_trumbore(
+    ray_origin: np.ndarray,
+    ray_dir: np.ndarray,
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    eps: float = 1e-8,
+) -> Optional[np.ndarray]:
+    """Möller–Trumbore ray-triangle intersection (single ray vs all triangles).
+
+    Pure-numpy fallback that does NOT require rtree or pyembree.
+    Tests the ray against every triangle and returns the closest hit.
+
+    Args:
+        ray_origin: (3,) ray origin
+        ray_dir: (3,) normalized ray direction
+        vertices: (V, 3) mesh vertices
+        faces: (F, 3) triangle face indices
+        eps: epsilon to avoid self-intersection
+
+    Returns:
+        (3,) intersection point or None if no hit
+    """
+    # Get triangle vertices for all faces at once
+    v0 = vertices[faces[:, 0]]  # (F, 3)
+    v1 = vertices[faces[:, 1]]  # (F, 3)
+    v2 = vertices[faces[:, 2]]  # (F, 3)
+
+    edge1 = v1 - v0  # (F, 3)
+    edge2 = v2 - v0  # (F, 3)
+
+    # h = cross(ray_dir, edge2)
+    h = np.cross(ray_dir, edge2)  # (F, 3)
+    a = np.einsum('j,ij->i', edge1, h)  # dot product per row: (F,)
+
+    # Check if ray is parallel to triangle
+    valid = np.abs(a) > eps
+
+    f = np.zeros(len(a))
+    f[valid] = 1.0 / a[valid]
+
+    # s = ray_origin - v0
+    s = ray_origin - v0  # (F, 3)
+
+    # u = f * dot(s, h)
+    u = f * np.einsum('ij,ij->i', s, h)
+
+    # Check u bounds
+    valid &= (u >= 0.0) & (u <= 1.0)
+
+    # q = cross(s, edge1)
+    q = np.cross(s, edge1)  # (F, 3)
+
+    # v = f * dot(ray_dir, q)
+    v = f * np.einsum('j,ij->i', ray_dir, q)
+
+    # Check v bounds
+    valid &= (v >= 0.0) & (u + v <= 1.0)
+
+    # t = f * dot(edge2, q)
+    t = f * np.einsum('ij,ij->i', edge2, q)
+
+    # Check t > eps (intersection in front of ray)
+    valid &= (t > eps)
+
+    if not np.any(valid):
+        return None
+
+    # Find closest valid intersection
+    t_valid = np.where(valid, t, np.inf)
+    closest_idx = np.argmin(t_valid)
+    t_closest = t[closest_idx]
+
+    return ray_origin + t_closest * ray_dir
+
+
 def get_mesh_3d_points_for_2d_keypoints(
     mesh: trimesh.Trimesh,
     keypoints_2d: np.ndarray,
@@ -585,6 +663,9 @@ def get_mesh_3d_points_for_2d_keypoints(
     """Get 3D points on the mesh surface corresponding to 2D keypoints.
 
     Projects rays from 2D keypoints and finds intersections with the mesh.
+    First tries trimesh's built-in ray intersection (which uses rtree/pyembree
+    if available for speed). If that fails (e.g. rtree not installed), falls
+    back to a pure-numpy Möller–Trumbore implementation.
 
     Args:
         mesh: The trimesh object
@@ -604,6 +685,25 @@ def get_mesh_3d_points_for_2d_keypoints(
     cx = camera_intrinsics[0, 2]
     cy = camera_intrinsics[1, 2]
 
+    # Try trimesh's ray intersection first (fast with rtree/pyembree)
+    use_trimesh_ray = True
+    try:
+        import rtree  # noqa: F401
+    except ImportError:
+        use_trimesh_ray = False
+
+    if not use_trimesh_ray:
+        # Check if pyembree is available as an alternative accelerator
+        try:
+            import embree  # noqa: F401
+            use_trimesh_ray = True
+        except ImportError:
+            logger.info(
+                "rtree/embree not installed — using pure-numpy Möller–Trumbore "
+                "ray-triangle intersection (slower but no extra dependencies). "
+                "Install rtree for faster ray queries: pip install rtree"
+            )
+
     points_3d = []
     for kp in keypoints_2d:
         u, v = kp[0], kp[1]
@@ -612,18 +712,32 @@ def get_mesh_3d_points_for_2d_keypoints(
         ray_dir = ray_dir / np.linalg.norm(ray_dir)
         ray_origin = np.array([0.0, 0.0, 0.0])
 
-        # Intersect ray with mesh
-        locations, index_ray, index_tri = mesh.ray.intersects_location(
-            ray_origins=[ray_origin],
-            ray_directions=[ray_dir],
-        )
+        found = False
 
-        if len(locations) > 0:
-            # Take the closest intersection
-            distances = np.linalg.norm(locations, axis=1)
-            closest_idx = np.argmin(distances)
-            points_3d.append(locations[closest_idx])
-        else:
-            points_3d.append(np.array([0.0, 0.0, 0.0]))  # fallback
+        if use_trimesh_ray:
+            try:
+                locations, index_ray, index_tri = mesh.ray.intersects_location(
+                    ray_origins=[ray_origin],
+                    ray_directions=[ray_dir],
+                )
+                if len(locations) > 0:
+                    distances = np.linalg.norm(locations, axis=1)
+                    closest_idx = np.argmin(distances)
+                    points_3d.append(locations[closest_idx])
+                    found = True
+            except Exception:
+                # Fall through to Möller–Trumbore
+                pass
+
+        if not found:
+            # Pure-numpy fallback: Möller–Trumbore ray-triangle intersection
+            hit = _ray_mesh_intersect_moller_trumbore(
+                ray_origin, ray_dir,
+                mesh.vertices, mesh.faces,
+            )
+            if hit is not None:
+                points_3d.append(hit)
+            else:
+                points_3d.append(np.array([0.0, 0.0, 0.0]))  # fallback
 
     return np.array(points_3d, dtype=np.float32)
