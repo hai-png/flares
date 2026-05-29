@@ -119,6 +119,10 @@ def _compute_alignment_2d_iou(
         px2 = corners_2d[:, 0].max()
         py2 = corners_2d[:, 1].max()
 
+        # Filter out invalid (behind-camera) projections
+        if px1 < -1e5 or py1 < -1e5:
+            return 0.0
+
         dx1, dy1, dx2, dy2 = bbox_2d.tolist()
 
         ix1 = max(px1, dx1)
@@ -392,6 +396,14 @@ def project_points_to_2d(
 
     u = fx * points_3d[:, 0] / z_safe + cx
     v = fy * points_3d[:, 1] / z_safe + cy
+
+    # Points behind the camera (z <= 0) produce invalid projections.
+    # Clamp them to large negative values so they fall outside any
+    # reasonable image bounds and are naturally excluded by downstream
+    # min/max filtering.
+    behind = z <= 0
+    u[behind] = -1e6
+    v[behind] = -1e6
 
     return np.stack([u, v], axis=1)
 

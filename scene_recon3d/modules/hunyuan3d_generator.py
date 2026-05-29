@@ -351,6 +351,7 @@ class Hunyuan3DGenerator:
                 if "bpy" not in sys.modules:
                     import types
                     sys.modules["bpy"] = types.ModuleType("bpy")
+                    logger.debug("Mocked bpy module for paint pipeline import")
                 # Mock realesrgan + basicsr
                 for mod_name in ("realesrgan", "basicsr", "basicsr.archs",
                                  "basicsr.archs.rrdbnet_arch"):
@@ -364,7 +365,6 @@ class Hunyuan3DGenerator:
                             _mod.RRDBNet = _StubRRDBNet
                         sys.modules[mod_name] = _mod
                         logger.debug(f"Mocked {mod_name} module for paint pipeline import")
-                    logger.debug("Mocked bpy module for paint pipeline import")
 
                 # Apply torchvision compatibility fix before importing the paint
                 # pipeline.  RealESRGAN (loaded inside the paint pipeline)
@@ -542,9 +542,15 @@ class Hunyuan3DGenerator:
 
         if self.shape_pipeline is not None:
             logger.info("Unloading Hunyuan3D shape pipeline...")
-            # Move to CPU first to free GPU allocations before deleting
+            # Move to CPU first to free GPU allocations before deleting.
+            # Some diffusers-style pipelines return None from .to() when
+            # sub-modules are already on the target device (e.g. via
+            # low_cpu_mem_usage).  Guard against None to avoid losing the
+            # reference before we can delete it.
             try:
-                self.shape_pipeline = self.shape_pipeline.to("cpu")
+                moved = self.shape_pipeline.to("cpu")
+                if moved is not None:
+                    self.shape_pipeline = moved
             except Exception:
                 pass
             del self.shape_pipeline
@@ -650,9 +656,9 @@ class Hunyuan3DGenerator:
         if self.shape_pipeline is None:
             self.load_model()
 
-        steps = num_inference_steps or self.num_inference_steps
-        gs = guidance_scale or self.guidance_scale
-        res = octree_resolution or self.octree_resolution
+        steps = num_inference_steps if num_inference_steps is not None else self.num_inference_steps
+        gs = guidance_scale if guidance_scale is not None else self.guidance_scale
+        res = octree_resolution if octree_resolution is not None else self.octree_resolution
 
         # Ensure RGBA with transparent background
         if image.mode != "RGBA":

@@ -142,7 +142,7 @@ class RFDETRDetector:
         if self.model is None:
             self.load_model()
 
-        threshold = threshold or self.confidence_threshold
+        threshold = threshold if threshold is not None else self.confidence_threshold
 
         # Run inference
         detections = self.model.predict(

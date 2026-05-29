@@ -246,7 +246,7 @@ class SceneReconstructionPipeline:
             save_intermediate=pipeline.get("save_intermediate", True),
             render_resolution=pipeline.get("render_resolution", 512),
             min_object_area=pipeline.get("min_object_area", 100),
-            low_vram_mode=pipeline.get("low_vram_mode", True),
+            low_vram_mode=pipeline.get("low_vram_mode", False),
         )
 
     @staticmethod
@@ -604,27 +604,33 @@ class SceneReconstructionPipeline:
                 )
                 continue
 
-            aligned_mesh, scale_factor, rotation, translation = align_mesh_to_bbox(
-                mesh=obj.mesh,
-                bbox_center=obj.bbox_3d_center,
-                bbox_dims=obj.bbox_3d_dims,
-                bbox_quat=obj.bbox_3d_quat,
-                camera_intrinsics=camera_intrinsics,
-                bbox_2d=obj.bbox_2d,
-            )
+            try:
+                aligned_mesh, scale_factor, rotation, translation = align_mesh_to_bbox(
+                    mesh=obj.mesh,
+                    bbox_center=obj.bbox_3d_center,
+                    bbox_dims=obj.bbox_3d_dims,
+                    bbox_quat=obj.bbox_3d_quat,
+                    camera_intrinsics=camera_intrinsics,
+                    bbox_2d=obj.bbox_2d,
+                )
 
-            obj.aligned_mesh = aligned_mesh
-            obj.scale_factor = scale_factor
-            obj.initial_rotation = rotation
-            obj.initial_translation = translation
+                obj.aligned_mesh = aligned_mesh
+                obj.scale_factor = scale_factor
+                obj.initial_rotation = rotation
+                obj.initial_translation = translation
 
-            logger.info(
-                f"Object {obj.object_id} ({obj.class_name}): "
-                f"scale={scale_factor:.4f}, "
-                f"center={obj.bbox_3d_center}, "
-                f"dims(W,L,H)={obj.bbox_3d_dims}, "
-                f"quat(w,x,y,z)={obj.bbox_3d_quat}"
-            )
+                logger.info(
+                    f"Object {obj.object_id} ({obj.class_name}): "
+                    f"scale={scale_factor:.4f}, "
+                    f"center={obj.bbox_3d_center}, "
+                    f"dims(W,L,H)={obj.bbox_3d_dims}, "
+                    f"quat(w,x,y,z)={obj.bbox_3d_quat}"
+                )
+            except Exception as e:
+                logger.error(
+                    f"Object {obj.object_id} alignment failed: {e}. Skipping."
+                )
+                continue
 
         self._stats.stage_times["4_alignment"] = time.time() - t0
 
@@ -740,8 +746,11 @@ class SceneReconstructionPipeline:
 
                         # Label
                         iou_val = 0.0
-                        if hasattr(obj, '_align_iou'):
-                            iou_val = obj._align_iou
+                        # Compute IoU between projected aligned mesh and 2D detection
+                        from .utils.geometry import _compute_alignment_2d_iou
+                        iou_val = _compute_alignment_2d_iou(
+                            obj.aligned_mesh, obj.bbox_2d, camera_intrinsics
+                        )
                         cv2.putText(vis_align, f"{obj.class_name} IoU={iou_val:.2f}",
                                     (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
                 cv2.imwrite(os.path.join(output_dir, "4_alignment_validation.png"),

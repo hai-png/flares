@@ -127,11 +127,20 @@ class WildDet3DEstimator:
                 "Downloading from HuggingFace..."
             )
             os.makedirs(os.path.dirname(self.checkpoint) or ".", exist_ok=True)
-            os.system(
-                f"huggingface-cli download allenai/WildDet3D "
-                f"wilddet3d_alldata_all_prompt_v1.0.pt "
-                f"--local-dir {os.path.dirname(self.checkpoint) or '.'}"
+            import subprocess
+            result = subprocess.run(
+                [
+                    "huggingface-cli", "download", "allenai/WildDet3D",
+                    "wilddet3d_alldata_all_prompt_v1.0.pt",
+                    "--local-dir", os.path.dirname(self.checkpoint) or ".",
+                ],
+                capture_output=True, text=True,
             )
+            if result.returncode != 0:
+                logger.warning(
+                    f"WildDet3D checkpoint download failed (exit code {result.returncode}): "
+                    f"{result.stderr}"
+                )
 
         try:
             from wilddet3d import build_model

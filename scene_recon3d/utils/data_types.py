@@ -99,7 +99,7 @@ class SceneReconstructionResult:
                 # 1-vertex placeholder mesh instead.
                 placeholder = trimesh.Trimesh(
                     vertices=[[0, 0, 0]],
-                    faces=[[0, 0, 0]],
+                    faces=[],
                 )
                 placeholder.export(path)
             return
