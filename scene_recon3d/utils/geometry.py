@@ -104,10 +104,12 @@ def align_mesh_to_bbox(
 
     Steps:
     1. Remap bbox dims: (W, L, H) → (L, H, W) to match (mesh_X, mesh_Y, mesh_Z)
-    2. Compute uniform scale factor from remapped ratios
-    3. Convert quaternion to rotation matrix
-    4. Apply axis conversion (OpenCV Y-down → mesh Y-up)
-    5. Center, scale, rotate, and translate the mesh
+    2. Sort both mesh and bbox dimensions for best matching
+    3. Compute uniform scale factor from sorted ratios (median for robustness)
+    4. Build permutation matrix from sorted dimension correspondence
+    5. Convert quaternion to rotation matrix
+    6. Apply axis conversion (mesh Y-up → camera Y-down)
+    7. Center, scale, permute, rotate, and translate the mesh
 
     Args:
         mesh: The canonical trimesh.Trimesh object
@@ -135,49 +137,89 @@ def align_mesh_to_bbox(
     #   mesh X ↔ L = bbox_dims[1]
     #   mesh Y ↔ H = bbox_dims[2]
     #   mesh Z ↔ W = bbox_dims[0]
-    W, L, H = bbox_dims[0], bbox_dims[1], bbox_dims[2]
+    W, L, H = float(bbox_dims[0]), float(bbox_dims[1]), float(bbox_dims[2])
     bbox_dims_remapped = np.array([L, H, W], dtype=np.float64)
 
-    # Compute uniform scale: map mesh extents to bbox dims (remapped)
+    # ── Sorted dimension matching ─────────────────────────────────
+    #
+    # The mesh from Hunyuan3D may have a different axis assignment
+    # than the bbox's local axes.  For example, the mesh's Y axis
+    # (up) might be the largest dimension while the bbox's L (X)
+    # is the largest.  By sorting both sets of dimensions in
+    # descending order and matching them, we find the best
+    # permutation of mesh axes to align with the bbox's local axes.
     mesh_extents_safe = np.maximum(mesh_extents, 1e-6)
-    scale_ratios = bbox_dims_remapped / mesh_extents_safe
-    # Use minimum ratio so the mesh fits inside the bbox on all axes
-    scale_factor = float(np.min(scale_ratios))
+    mesh_sorted_idx = np.argsort(mesh_extents_safe)[::-1]   # indices that sort descending
+    bbox_sorted_idx = np.argsort(bbox_dims_remapped)[::-1]
 
-    logger.info(
-        f"  Scale computation: mesh_extents={mesh_extents}, "
-        f"bbox_dims=(W={W:.3f}, L={L:.3f}, H={H:.3f}), "
-        f"remapped=(L={L:.3f}, H={H:.3f}, W={W:.3f}), "
-        f"ratios={scale_ratios}, scale={scale_factor:.4f}"
-    )
+    mesh_sorted = mesh_extents_safe[mesh_sorted_idx]
+    bbox_sorted = bbox_dims_remapped[bbox_sorted_idx]
+
+    # Compute uniform scale from sorted pairs.
+    # Use median instead of min — min makes objects too small when
+    # the mesh and bbox shapes don't match well.  Median gives a
+    # balanced scale that keeps at least 2 of 3 dimensions close.
+    scale_ratios_sorted = bbox_sorted / mesh_sorted
+    scale_factor = float(np.median(scale_ratios_sorted))
+
+    # ── Build permutation matrix ──────────────────────────────────
+    #
+    # R_perm maps mesh axis mesh_sorted_idx[i] to bbox axis
+    # bbox_sorted_idx[i] so that the i-th largest mesh dimension
+    # aligns with the i-th largest bbox dimension.
+    R_perm = np.zeros((3, 3), dtype=np.float64)
+    for i in range(3):
+        R_perm[bbox_sorted_idx[i], mesh_sorted_idx[i]] = 1.0
+
+    # Ensure R_perm is a proper rotation (det = +1).
+    # Permutation matrices that swap an odd number of axes have det=-1.
+    # Negate the row corresponding to the smallest dimension so that
+    # the visual error from the sign flip is least noticeable.
+    if np.linalg.det(R_perm) < 0:
+        smallest_bbox_idx = bbox_sorted_idx[-1]
+        R_perm[smallest_bbox_idx] *= -1.0
 
     # ── Rotation from quaternion ──────────────────────────────────
-    R = quaternion_to_rotation_matrix(bbox_quat)
+    R_quat = quaternion_to_rotation_matrix(bbox_quat)
 
     # ── Axis convention conversion ────────────────────────────────
     # WildDet3D uses OpenCV (Y-down, Z-forward).
     # Hunyuan3D generates meshes in Y-up convention.
-    # The quaternion rotates the box in camera coordinates.
-    # We need to convert the mesh from Y-up to camera Y-down BEFORE
-    # applying the quaternion rotation.
-    #
     # The conversion: (x, y, z)_mesh → (x, -y, -z)_camera
-    # This is a 180° rotation around X: diag(1, -1, -1)
+    # This is diag(1, -1, -1)
     #
-    # Combined rotation: R_final = R_quat @ axis_conversion
-    # Effect: first convert mesh to camera frame, then rotate by quaternion
+    # The full rotation is: R = R_quat @ R_axis @ R_perm
+    # where:
+    #   R_perm  reorders mesh axes to match bbox local axes
+    #   R_axis  converts from Y-up to Y-down (camera convention)
+    #   R_quat  rotates from bbox local frame to camera frame
     if bbox_up_axis == "y":
-        axis_conversion = np.array([
+        R_axis = np.array([
             [1,  0,  0],
             [0, -1,  0],
             [0,  0, -1],
         ], dtype=np.float64)
-        R = R @ axis_conversion
+    else:
+        R_axis = np.eye(3, dtype=np.float64)
+
+    R = R_quat @ R_axis @ R_perm
+
+    # Log detailed alignment info for debugging
+    scale_ratios_direct = bbox_dims_remapped / mesh_extents_safe
+    logger.info(
+        f"  Scale computation: mesh_extents={mesh_extents}, "
+        f"bbox_dims=(W={W:.3f}, L={L:.3f}, H={H:.3f}), "
+        f"remapped=(L={L:.3f}, H={H:.3f}, W={W:.3f}), "
+        f"direct_ratios={scale_ratios_direct}, "
+        f"sorted_ratios={scale_ratios_sorted}, "
+        f"scale={scale_factor:.4f}, "
+        f"perm_axes(mesh→bbox)={list(zip(mesh_sorted_idx, bbox_sorted_idx))}"
+    )
 
     # ── Build the full transformation ─────────────────────────────
     # 1. Center the mesh at origin
     # 2. Scale it
-    # 3. Rotate it
+    # 3. Rotate it (includes permutation + axis conversion + quaternion)
     # 4. Translate to bbox center
 
     # Center the mesh at origin first
@@ -758,7 +800,7 @@ def _ray_mesh_intersect_moller_trumbore(
 
     # h = cross(ray_dir, edge2)
     h = np.cross(ray_dir, edge2)  # (F, 3)
-    a = np.einsum('j,ij->i', edge1, h)  # dot product per row: (F,)
+    a = np.einsum('ij,ij->i', edge1, h)  # dot product per row: (F,)
 
     # Check if ray is parallel to triangle
     valid = np.abs(a) > eps

@@ -555,6 +555,25 @@ class SceneReconstructionPipeline:
         self._stats.stage_times["3_hunyuan3d"] = time.time() - t0
         self._stats.num_objects_meshed = sum(1 for o in objects if o.mesh is not None)
 
+        # Save Stage 3 debug info (mesh dimensions for alignment debugging)
+        if self.save_intermediate:
+            import json
+            mesh_debug = []
+            for obj in objects:
+                if obj.mesh is not None:
+                    mesh_debug.append({
+                        "object_id": obj.object_id,
+                        "class_name": obj.class_name,
+                        "mesh_extents": obj.mesh.extents.tolist(),
+                        "mesh_bounds_min": obj.mesh.bounds[0].tolist(),
+                        "mesh_bounds_max": obj.mesh.bounds[1].tolist(),
+                        "num_vertices": len(obj.mesh.vertices),
+                        "num_faces": len(obj.mesh.faces),
+                        "mesh_path": obj.mesh_path,
+                    })
+            with open(os.path.join(output_dir, "3_mesh_debug.json"), "w") as f:
+                json.dump(mesh_debug, f, indent=2)
+
         # Free Hunyuan3D from GPU — it's the heaviest model and Stage 4 is CPU-only
         if self.low_vram_mode:
             self._unload_model("generator")
@@ -754,33 +773,44 @@ class SceneReconstructionPipeline:
             os.makedirs(refined_dir, exist_ok=True)
             marco_debug = []
             for obj in objects:
-                if obj.refined_rotation is not None:
-                    # Save refined mesh (apply refined transform to canonical mesh)
+                if obj.aligned_mesh is not None:
+                    # Determine the final rotation and translation
+                    if obj.refined_rotation is not None:
+                        R = obj.refined_rotation
+                        t = obj.refined_translation
+                    else:
+                        R = obj.initial_rotation
+                        t = obj.initial_translation
+                    scale_factor = obj.scale_factor if obj.scale_factor is not None else 1.0
+
+                    # Save refined/final mesh (apply transform to canonical mesh)
                     refined_mesh = obj.mesh.copy()
                     mesh_center = refined_mesh.bounds.mean(axis=0)
                     refined_mesh.apply_translation(-mesh_center)
-                    scale_factor = obj.scale_factor if obj.scale_factor is not None else 1.0
                     refined_mesh.apply_scale(scale_factor)
                     T_rot = np.eye(4)
-                    T_rot[:3, :3] = obj.refined_rotation
+                    T_rot[:3, :3] = R
                     refined_mesh.apply_transform(T_rot)
-                    refined_mesh.apply_translation(obj.refined_translation)
-                    path = os.path.join(refined_dir, f"{obj.class_name}_{obj.object_id}_refined.glb")
+                    refined_mesh.apply_translation(t)
+                    suffix = "_refined" if obj.refined_rotation is not None else "_aligned"
+                    path = os.path.join(refined_dir, f"{obj.class_name}_{obj.object_id}{suffix}.glb")
                     refined_mesh.export(path)
 
+                    init_R = obj.initial_rotation if obj.initial_rotation is not None else np.eye(3)
+                    init_t = obj.initial_translation if obj.initial_translation is not None else np.zeros(3)
                     debug_info = {
                         "object_id": obj.object_id,
                         "class_name": obj.class_name,
-                        "refined_rotation": obj.refined_rotation.tolist(),
-                        "refined_translation": obj.refined_translation.tolist(),
+                        "was_refined": obj.refined_rotation is not None,
+                        "scale_factor": float(scale_factor),
+                        "refined_rotation": obj.refined_rotation.tolist() if obj.refined_rotation is not None else None,
+                        "refined_translation": obj.refined_translation.tolist() if obj.refined_translation is not None else None,
                         "initial_rotation": obj.initial_rotation.tolist() if obj.initial_rotation is not None else None,
                         "initial_translation": obj.initial_translation.tolist() if obj.initial_translation is not None else None,
-                        "rotation_diff_norm": float(np.linalg.norm(
-                            obj.refined_rotation - (obj.initial_rotation if obj.initial_rotation is not None else np.eye(3))
-                        )),
-                        "translation_diff_norm": float(np.linalg.norm(
-                            obj.refined_translation - (obj.initial_translation if obj.initial_translation is not None else np.zeros(3))
-                        )),
+                        "rotation_diff_norm": float(np.linalg.norm(R - init_R)),
+                        "translation_diff_norm": float(np.linalg.norm(t - init_t)),
+                        "num_correspondence_src": len(obj.correspondence_points_src) if obj.correspondence_points_src is not None else 0,
+                        "num_correspondence_tgt": len(obj.correspondence_points_tgt) if obj.correspondence_points_tgt is not None else 0,
                     }
                     marco_debug.append(debug_info)
 

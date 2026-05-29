@@ -261,9 +261,17 @@ class MARCORefiner:
             )
 
             # 2. Render the mesh with current pose
-            current_transform = np.eye(4)
-            current_transform[:3, :3] = current_R
-            current_transform[:3, 3] = current_t
+            # CRITICAL: the transform must include scale so that the
+            # rendered mesh matches the object's actual size in the scene.
+            # Without scale, MARCO compares a canonical-size render against
+            # the cropped object image, producing wrong correspondences.
+            T_scale = np.eye(4)
+            T_scale[0, 0] = T_scale[1, 1] = T_scale[2, 2] = scale_factor
+            T_rot = np.eye(4)
+            T_rot[:3, :3] = current_R
+            T_trans = np.eye(4)
+            T_trans[:3, 3] = current_t
+            current_transform = T_trans @ T_rot @ T_scale
 
             try:
                 rendered_image = render_mesh_for_marco(
@@ -291,6 +299,7 @@ class MARCORefiner:
                 src_kps_scaled[:, 1] *= h_ratio
             else:
                 src_kps_scaled = src_keypoints
+                h_ratio = w_ratio = 1.0
 
             # 3. Find correspondences using MARCO
             try:
@@ -323,7 +332,7 @@ class MARCORefiner:
             obj.correspondence_points_tgt = tgt_kps_valid
 
             # 4. Get 3D points on the mesh for these keypoints
-            # Map source keypoints back to mesh surface
+            # Map source keypoints back to crop-image coordinates
             src_kps_original = src_kps_valid.copy()
             if obj.crop_image is not None:
                 src_kps_original[:, 0] /= w_ratio
@@ -349,7 +358,7 @@ class MARCORefiner:
                     obj.mesh,
                     src_kps_original,
                     K_crop,
-                    mesh_transform=None,  # canonical mesh
+                    mesh_transform=None,  # canonical mesh (centered at origin)
                 )
             except Exception as e:
                 logger.warning(
@@ -358,13 +367,27 @@ class MARCORefiner:
                 break
 
             # 5. Refine pose using PnP with correspondences
+            # CRITICAL: tgt_points_2d are in render_resolution pixel
+            # coordinates, so we must scale the camera intrinsics from
+            # the original image resolution to render_resolution before
+            # passing them to solvePnP.  Without this scaling, solvePnP
+            # interprets the points as if they were in the original image
+            # and computes a wrong focal length → wrong pose.
+            K_scaled = camera_intrinsics.copy()
+            if original_image_shape is not None:
+                orig_h, orig_w = original_image_shape
+                K_scaled[0, 0] *= render_resolution / orig_w   # fx
+                K_scaled[0, 2] *= render_resolution / orig_w   # cx
+                K_scaled[1, 1] *= render_resolution / orig_h   # fy
+                K_scaled[1, 2] *= render_resolution / orig_h   # cy
+
             refined_R, refined_t = refine_pose_with_correspondences(
                 current_rotation=current_R,
                 current_translation=current_t,
                 src_points_2d=src_kps_valid,
                 tgt_points_2d=tgt_kps_valid,
                 src_points_3d=points_3d,
-                camera_intrinsics=camera_intrinsics,
+                camera_intrinsics=K_scaled,
                 scale_factor=scale_factor,
                 mesh=obj.mesh,
             )
