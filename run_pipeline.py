@@ -115,22 +115,6 @@ def check_environment():
         logger.warning(f"Hunyuan3D-Shape not available: {e}")
 
     try:
-        # Mock bpy if not installed — the paint pipeline imports it at the
-        # top level but we don't call bpy-dependent functions (save_glb=False)
-        if "bpy" not in sys.modules:
-            import types
-            sys.modules["bpy"] = types.ModuleType("bpy")
-        # Mock realesrgan + basicsr for paint pipeline import
-        for _mod_name in ("realesrgan", "basicsr", "basicsr.archs",
-                          "basicsr.archs.rrdbnet_arch"):
-            if _mod_name not in sys.modules:
-                import types as _types
-                _m = _types.ModuleType(_mod_name)
-                if _mod_name == "basicsr.archs.rrdbnet_arch":
-                    class _StubRRDBNet:
-                        def __init__(self, *a, **kw): pass
-                    _m.RRDBNet = _StubRRDBNet
-                sys.modules[_mod_name] = _m
         from textureGenPipeline import Hunyuan3DPaintPipeline
         checks["Hunyuan3D-Paint"] = True
     except ImportError:
