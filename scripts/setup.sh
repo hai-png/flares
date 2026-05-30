@@ -567,6 +567,17 @@ except Exception as e:
     print(f'  ✗ Hunyuan3D-Shape: {e}')
 
 try:
+    # Mock bpy (Blender Python API) — required by DifferentiableRenderer
+    # but only needed if save_glb=True (which we avoid with our own GLB converter).
+    import types, sys as _sys
+    for _mod in ('bpy', 'realesrgan', 'basicsr', 'basicsr.archs', 'basicsr.archs.rrdbnet_arch'):
+        if _mod not in _sys.modules:
+            _m = types.ModuleType(_mod)
+            if _mod == 'basicsr.archs.rrdbnet_arch':
+                class _StubNet:
+                    def __init__(self, *a, **kw): pass
+                _m.RRDBNet = _StubNet
+            _sys.modules[_mod] = _m
     from textureGenPipeline import Hunyuan3DPaintPipeline
     print('  ✓ Hunyuan3D-Paint')
 except Exception as e:
