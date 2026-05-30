@@ -136,7 +136,7 @@ $PYTHON_CMD -m pip install --quiet \
     huggingface_hub \
     safetensors \
     supervision \
-    "rembg>=2.0,<2.0.50" \
+    rembg \
     pygltflib
 
 # ─── 4. Install the scene_recon3d package ──────────────────────
